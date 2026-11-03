@@ -96,6 +96,9 @@ pub fn load_shortcut(app: &AppHandle) -> String {
 }
 
 pub fn save_shortcut(app: &AppHandle, shortcut: &str) -> Result<(), String> {
+    if !has_modifier(shortcut) {
+        return Err("请带上 Ctrl、Alt 或 Shift".to_string());
+    }
     let path = config_file(app)?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|error| error.to_string())?;
@@ -104,7 +107,12 @@ pub fn save_shortcut(app: &AppHandle, shortcut: &str) -> Result<(), String> {
         shortcut: shortcut.to_string(),
     })
     .map_err(|error| error.to_string())?;
-    std::fs::write(path, text).map_err(|error| error.to_string())
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, &text).map_err(|error| error.to_string())?;
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|error| error.to_string())?;
+    }
+    std::fs::rename(&temp, &path).map_err(|error| error.to_string())
 }
 
 pub fn autostart_enabled() -> bool {
@@ -115,6 +123,9 @@ pub fn autostart_enabled() -> bool {
 }
 
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
+    if autostart_enabled() == enabled {
+        return Ok(());
+    }
     if enabled {
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
         reg(&[
@@ -189,6 +200,14 @@ mod tests {
             set_autostart(true).expect("restore");
         }
     }
+    #[test]
+    fn shortcut_requires_a_modifier() {
+        assert!(has_modifier("Alt+Space"));
+        assert!(has_modifier("Ctrl+Shift+KeyK"));
+        assert!(!has_modifier("Space"));
+        assert!(!has_modifier(""));
+    }
+
     #[test]
     fn labels_default_shortcut() {
         assert_eq!(shortcut_label("Alt+Space"), "Alt + 空格");
