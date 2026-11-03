@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import logo from "./assets/Veery-Log_compressed.png";
 
 type SettingsInfo = {
@@ -114,6 +115,20 @@ function sameShortcut(next: string, current: string) {
 
 onMounted(() => {
   window.addEventListener("keydown", onKeydown);
+  void listen<{ ctrl: boolean; shift: boolean; alt: boolean }>("alt-space", (event) => {
+    if (!recording.value) return;
+    const mods = event.payload;
+    void onKeydown(
+      new KeyboardEvent("keydown", {
+        key: " ",
+        code: "Space",
+        ctrlKey: mods.ctrl,
+        shiftKey: mods.shift,
+        altKey: mods.alt,
+        cancelable: true,
+      }),
+    );
+  });
   void load();
 });
 </script>

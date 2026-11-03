@@ -3,12 +3,16 @@ mod settings;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
+use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, SC_KEYMENU, WM_SYSCOMMAND};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 struct AppState {
@@ -49,6 +53,103 @@ fn set_memory_level(window: &tauri::WebviewWindow, low: bool) {
         let _ = core.SetMemoryUsageTargetLevel(level);
     });
 }
+
+fn held(vk: i32) -> bool {
+    unsafe { (GetAsyncKeyState(vk) as u16) & 0x8000 != 0 }
+}
+
+unsafe extern "system" fn suppress_system_menu(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _data: usize,
+) -> LRESULT {
+    if msg == WM_SYSCOMMAND && (wparam.0 & 0xFFF0) == SC_KEYMENU as usize {
+        return LRESULT(0);
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
+unsafe extern "system" fn subclass_child(hwnd: HWND, _lparam: LPARAM) -> windows::core::BOOL {
+    unsafe {
+        let _ = SetWindowSubclass(hwnd, Some(suppress_system_menu), 1, 0);
+    }
+    windows::core::BOOL(1)
+}
+
+fn guard_alt_space(window: &tauri::WebviewWindow) {
+    if let Ok(hwnd) = window.hwnd() {
+        unsafe {
+            let _ = SetWindowSubclass(hwnd, Some(suppress_system_menu), 1, 0);
+            let _ = EnumChildWindows(Some(hwnd), Some(subclass_child), LPARAM(0));
+        }
+    }
+    let window = window.clone();
+    let _ = window.clone().with_webview(move |webview| unsafe {
+        use webview2_com::AcceleratorKeyPressedEventHandler;
+        use webview2_com::Microsoft::Web::WebView2::Win32::{
+            COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_KEY_EVENT_KIND_KEY_UP,
+            COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN, COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_UP,
+        };
+
+        let handler = AcceleratorKeyPressedEventHandler::create(Box::new(move |_sender, args| {
+            let Some(args) = args else {
+                return Ok(());
+            };
+            let mut kind = COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN;
+            let mut key = 0u32;
+            args.KeyEventKind(&mut kind)?;
+            args.VirtualKey(&mut key)?;
+            if key != VK_SPACE as u32 || !held(VK_MENU) {
+                return Ok(());
+            }
+            let down = kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+                || kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN;
+            let up = kind == COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_UP
+                || kind == COREWEBVIEW2_KEY_EVENT_KIND_KEY_UP;
+            if !down && !up {
+                return Ok(());
+            }
+            args.SetHandled(true)?;
+            if down && !ALT_SPACE_DOWN.swap(true, Ordering::Relaxed) {
+                let _ = window.emit(
+                    "alt-space",
+                    HeldKeys {
+                        ctrl: held(VK_CONTROL),
+                        shift: held(VK_SHIFT),
+                        alt: true,
+                    },
+                );
+            }
+            if up {
+                ALT_SPACE_DOWN.store(false, Ordering::Relaxed);
+            }
+            Ok(())
+        }));
+        let mut token = 0i64;
+        let _ = webview.controller().add_AcceleratorKeyPressed(&handler, &mut token);
+    });
+}
+
+#[derive(Clone, serde::Serialize)]
+struct HeldKeys {
+    ctrl: bool,
+    shift: bool,
+    alt: bool,
+}
+
+#[link(name = "user32")]
+unsafe extern "system" {
+    fn GetAsyncKeyState(vkey: i32) -> i16;
+}
+
+const VK_SHIFT: i32 = 0x10;
+const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
+const VK_SPACE: i32 = 0x20;
+static ALT_SPACE_DOWN: AtomicBool = AtomicBool::new(false);
 
 fn tune_webview(window: &tauri::WebviewWindow) {
     let _ = window.with_webview(|webview| unsafe {
@@ -178,6 +279,10 @@ fn show_settings(app: &AppHandle) {
         .and_then(|builder| builder.build())
     {
         eprintln!("veery: 设置窗口创建失败: {error}");
+        return;
+    }
+    if let Some(window) = app.get_webview_window("settings") {
+        guard_alt_space(&window);
     }
 }
 
