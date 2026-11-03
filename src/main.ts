@@ -1,6 +1,5 @@
 import { createApp } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import App from "./App.vue";
 
 function isSettingsWindow() {
   try {
@@ -15,5 +14,7 @@ if (isSettingsWindow()) {
     createApp(Settings).mount("#app");
   });
 } else {
-  createApp(App).mount("#app");
+  void import("./App.vue").then(({ default: App }) => {
+    createApp(App).mount("#app");
+  });
 }
