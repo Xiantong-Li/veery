@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -6,6 +7,7 @@ use winreg::enums::{HKEY_CURRENT_USER, KEY_READ, KEY_WRITE};
 use winreg::RegKey;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_KEY_CMD: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_NAME: &str = "Veery";
 pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
 
@@ -113,19 +115,48 @@ pub fn autostart_enabled() -> bool {
 }
 
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
-    let key = run_key()?;
     if enabled {
         let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-        let command = format!("\"{}\"", exe.display());
-        key.set_value(RUN_NAME, &command)
-            .map_err(|error| error.to_string())
+        reg(&[
+            "add",
+            RUN_KEY_CMD,
+            "/v",
+            RUN_NAME,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &format!("\"{}\"", exe.display()),
+            "/f",
+        ])?;
     } else {
-        match key.delete_value(RUN_NAME) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.to_string()),
-        }
+        let _ = reg(&["delete", RUN_KEY_CMD, "/v", RUN_NAME, "/f"]);
     }
+    if autostart_enabled() != enabled {
+        return Err("开机启动没有写入成功，系统拒绝了这项修改".to_string());
+    }
+    Ok(())
+}
+
+fn reg(args: &[&str]) -> Result<(), String> {
+    let output = Command::new(reg_exe())
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr);
+    let detail = detail.trim();
+    if detail.is_empty() {
+        Err("开机启动修改失败".to_string())
+    } else {
+        Err(detail.to_string())
+    }
+}
+
+fn reg_exe() -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    format!(r"{root}\System32\reg.exe")
 }
 
 fn run_key() -> Result<RegKey, String> {
@@ -147,6 +178,17 @@ fn config_file(app: &AppHandle) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn autostart_round_trip() {
+        let was = autostart_enabled();
+        set_autostart(true).expect("enable");
+        assert!(autostart_enabled());
+        set_autostart(false).expect("disable");
+        assert!(!autostart_enabled());
+        if was {
+            set_autostart(true).expect("restore");
+        }
+    }
     #[test]
     fn labels_default_shortcut() {
         assert_eq!(shortcut_label("Alt+Space"), "Alt + 空格");
