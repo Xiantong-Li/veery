@@ -34,7 +34,7 @@ fn mark_shown(app: &AppHandle) {
 fn set_memory_level(window: &tauri::WebviewWindow, low: bool) {
     let _ = window.with_webview(move |webview| unsafe {
         use webview2_com::Microsoft::Web::WebView2::Win32::{
-            ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+            ICoreWebView2_3, ICoreWebView2_19, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
             COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
         };
         use windows::core::Interface;
@@ -42,6 +42,11 @@ fn set_memory_level(window: &tauri::WebviewWindow, low: bool) {
         let Ok(core) = webview.controller().CoreWebView2() else {
             return;
         };
+        if !low {
+            if let Ok(core) = core.cast::<ICoreWebView2_3>() {
+                let _ = core.Resume();
+            }
+        }
         let Ok(core) = core.cast::<ICoreWebView2_19>() else {
             return;
         };
@@ -201,6 +206,7 @@ fn show_launcher(app: &AppHandle) {
     };
     mark_shown(app);
     set_memory_level(&window, false);
+    let _ = window.set_size(tauri::LogicalSize::new(960.0, 132.0));
     place_launcher(&window);
     let _ = window.show();
     let _ = window.unminimize();

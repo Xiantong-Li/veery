@@ -8,6 +8,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 type Hit = { id: number; name: string; icon: string | null };
 
 const WINDOW_WIDTH = 960;
+const IDLE_HEIGHT = 132;
 
 const query = ref("");
 const results = ref<Hit[]>([]);
@@ -28,6 +29,7 @@ async function fit() {
   if (menuEl.value) {
     height = Math.max(height, Math.ceil(menuEl.value.getBoundingClientRect().bottom + 16));
   }
+  if (height < IDLE_HEIGHT) return;
   if (height === fitted) return;
   fitted = height;
   try {
@@ -149,8 +151,8 @@ onMounted(async () => {
     selected.value = 0;
     results.value = [];
     menu.value = null;
+    fitted = IDLE_HEIGHT;
     await focusInput();
-    await fit();
   });
   await listen("hidden", async () => {
     query.value = "";
@@ -158,7 +160,7 @@ onMounted(async () => {
     selected.value = 0;
     results.value = [];
     menu.value = null;
-    await fit();
+    fitted = IDLE_HEIGHT;
   });
   await focusInput();
   await fit();
@@ -238,6 +240,7 @@ body {
   background: #ffffff;
   border-radius: 16px;
   overflow: hidden;
+  transform: translateZ(0);
   box-shadow:
     0 2px 6px rgba(0, 0, 0, 0.05),
     0 12px 32px rgba(0, 0, 0, 0.1);
