@@ -1,61 +1,73 @@
 <script setup lang="ts">
-import { nextTick, onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
-import { LogicalSize } from "@tauri-apps/api/dpi";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 type Hit = { id: number; name: string; icon: string | null };
-
-const WINDOW_WIDTH = 960;
-const IDLE_HEIGHT = 132;
+type SearchBody = { ready: boolean; hits: Hit[] };
 
 const query = ref("");
 const results = ref<Hit[]>([]);
+const answered = ref("");
+const indexing = ref(false);
 const selected = ref(0);
 const error = ref("");
 const inputEl = ref<HTMLInputElement | null>(null);
-const stageEl = ref<HTMLElement | null>(null);
+const sheetEl = ref<HTMLElement | null>(null);
 const menuEl = ref<HTMLElement | null>(null);
 const menu = ref<{ id: number; x: number; y: number } | null>(null);
-let fitted = 0;
 let request = 0;
 
-async function fit() {
-  await nextTick();
-  const node = stageEl.value;
-  if (!node) return;
-  let height = Math.ceil(node.getBoundingClientRect().height);
-  if (menuEl.value) {
-    height = Math.max(height, Math.ceil(menuEl.value.getBoundingClientRect().bottom + 16));
+const settled = computed(() => query.value.trim() !== "" && answered.value === query.value);
+const drawerOpen = computed(
+  () =>
+    Boolean(error.value) ||
+    indexing.value ||
+    (query.value.trim() !== "" && (results.value.length > 0 || settled.value)),
+);
+
+let searchTimer = 0;
+
+function scheduleRefresh() {
+  window.clearTimeout(searchTimer);
+  const text = query.value;
+  menu.value = null;
+  if (!text.trim()) {
+    request += 1;
+    results.value = [];
+    selected.value = 0;
+    answered.value = "";
+    indexing.value = false;
+    error.value = "";
+    return;
   }
-  if (height < IDLE_HEIGHT) return;
-  if (height === fitted) return;
-  fitted = height;
-  try {
-    await getCurrentWindow().setSize(new LogicalSize(WINDOW_WIDTH, height));
-  } catch {
-    // 浏览器预览里没有窗口接口
-  }
+  if (text === answered.value && !error.value && !indexing.value) return;
+  searchTimer = window.setTimeout(() => {
+    void refresh();
+  }, 40);
 }
 
 async function refresh() {
   const current = ++request;
   const text = query.value;
-  menu.value = null;
-  if (!text.trim()) {
-    results.value = [];
-    selected.value = 0;
-    await fit();
-    return;
+  if (!text.trim()) return;
+  try {
+    // 这里只能丢掉过期的返回值，已经发出的搜索仍会在后端算完。
+    const body = await invoke<SearchBody>("search", { query: text });
+    if (current !== request) return;
+    indexing.value = !body.ready;
+    error.value = "";
+    if (!body.ready) return;
+    results.value = body.hits;
+    answered.value = text;
+    if (selected.value >= results.value.length) {
+      selected.value = 0;
+    }
+  } catch (cause) {
+    if (current !== request) return;
+    indexing.value = false;
+    error.value = String(cause);
   }
-  const hits = await invoke<Hit[]>("search", { query: text });
-  if (current !== request) return;
-  results.value = hits;
-  if (selected.value >= results.value.length) {
-    selected.value = 0;
-  }
-  await fit();
 }
 
 async function act(command: "launch" | "launch_admin" | "reveal", id: number) {
@@ -67,7 +79,6 @@ async function act(command: "launch" | "launch_admin" | "reveal", id: number) {
   } catch (cause) {
     error.value = String(cause);
   }
-  await fit();
 }
 
 async function openSelected() {
@@ -82,6 +93,18 @@ function openMenu(index: number, event: MouseEvent) {
   selected.value = index;
   menu.value = { id: hit.id, x: event.clientX, y: event.clientY };
   void placeMenu();
+}
+
+function onPointerDown(event: PointerEvent) {
+  const target = event.target;
+  if (!(target instanceof Node)) return;
+  if (menuEl.value?.contains(target)) return;
+  if (sheetEl.value?.contains(target)) {
+    if (!menu.value || event.button === 2) return;
+    menu.value = null;
+    return;
+  }
+  void invoke("hide_window");
 }
 
 async function placeMenu() {
@@ -102,15 +125,6 @@ async function placeMenu() {
     x: Math.max(margin, x),
     y: Math.max(margin, y),
   };
-  await fit();
-}
-
-function closeMenu(event: PointerEvent) {
-  if (!menu.value || event.button === 2) return;
-  const target = event.target;
-  if (target instanceof Node && menuEl.value?.contains(target)) return;
-  menu.value = null;
-  void fit();
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -130,7 +144,6 @@ function onKeydown(event: KeyboardEvent) {
     event.preventDefault();
     if (menu.value) {
       menu.value = null;
-      void fit();
       return;
     }
     void invoke("hide_window");
@@ -143,44 +156,72 @@ async function focusInput() {
   inputEl.value?.select();
 }
 
+const stops: UnlistenFn[] = [];
+
 onMounted(async () => {
-  window.addEventListener("pointerdown", closeMenu);
-  await listen("shown", async () => {
-    query.value = "";
-    error.value = "";
-    selected.value = 0;
-    results.value = [];
-    menu.value = null;
-    fitted = IDLE_HEIGHT;
-    await focusInput();
-  });
-  await listen("hidden", async () => {
-    query.value = "";
-    error.value = "";
-    selected.value = 0;
-    results.value = [];
-    menu.value = null;
-    fitted = IDLE_HEIGHT;
-  });
+  window.addEventListener("pointerdown", onPointerDown);
+  try {
+    stops.push(
+      await listen("shown", async () => {
+        query.value = "";
+        error.value = "";
+        selected.value = 0;
+        results.value = [];
+        answered.value = "";
+        indexing.value = false;
+        menu.value = null;
+        await focusInput();
+      }),
+    );
+    stops.push(
+      await listen("hidden", async () => {
+        query.value = "";
+        error.value = "";
+        selected.value = 0;
+        results.value = [];
+        answered.value = "";
+        indexing.value = false;
+        menu.value = null;
+      }),
+    );
+    stops.push(
+      await listen("catalog-ready", () => {
+        indexing.value = false;
+        results.value = [];
+        answered.value = "";
+        selected.value = 0;
+        if (query.value.trim()) scheduleRefresh();
+      }),
+    );
+  } catch (cause) {
+    error.value = String(cause);
+  }
   await focusInput();
-  await fit();
+});
+
+onUnmounted(() => {
+  window.clearTimeout(searchTimer);
+  window.removeEventListener("pointerdown", onPointerDown);
+  for (const stop of stops) stop();
 });
 </script>
 
 <template>
-  <main ref="stageEl" class="stage">
-    <section class="sheet">
+  <main class="stage">
+    <section ref="sheetEl" class="sheet">
       <input
         ref="inputEl"
         v-model="query"
         class="query"
         spellcheck="false"
         placeholder="搜索"
-        @input="refresh"
+        @input="scheduleRefresh"
         @keydown="onKeydown"
       />
-      <p v-if="error" class="note error">{{ error }}</p>
-      <ul v-else-if="query.trim() && results.length" class="results">
+      <div class="drawer" :class="{ open: drawerOpen }">
+        <div>
+          <p v-if="error" class="note error">{{ error }}</p>
+          <ul v-else-if="results.length" class="results">
         <li v-for="(item, index) in results" :key="item.id">
           <button
             type="button"
@@ -194,9 +235,12 @@ onMounted(async () => {
             <span v-else class="icon placeholder"></span>
             <span class="name">{{ item.name }}</span>
           </button>
-        </li>
-      </ul>
-      <p v-else-if="query.trim()" class="note">没有匹配的程序</p>
+            </li>
+          </ul>
+          <p v-else-if="indexing" class="note">正在读取开始菜单</p>
+          <p v-else-if="settled" class="note">没有匹配的程序</p>
+        </div>
+      </div>
     </section>
     <div
       v-if="menu"
@@ -263,8 +307,23 @@ body {
   user-select: text;
 }
 
-.sheet:has(.results, .note) .query {
+.sheet:has(.drawer.open) .query {
   border-bottom: 1px solid #f0f0f0;
+}
+
+.drawer {
+  display: grid;
+  grid-template-rows: 0fr;
+  transition: grid-template-rows 0.28s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+.drawer.open {
+  grid-template-rows: 1fr;
+}
+
+.drawer > div {
+  min-height: 0;
+  overflow: hidden;
 }
 
 .query::placeholder {
@@ -356,5 +415,11 @@ body {
 
 .menu button:hover {
   background: #f2f2f2;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drawer {
+    transition: none;
+  }
 }
 </style>

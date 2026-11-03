@@ -130,6 +130,7 @@ function sameShortcut(next: string, current: string) {
 }
 
 let menuObserver: ResizeObserver | null = null;
+let stopAltSpace: (() => void) | null = null;
 
 watch(page, () => {
   void nextTick(moveSelection);
@@ -160,12 +161,20 @@ onMounted(() => {
         cancelable: true,
       }),
     );
-  });
+  })
+    .then((stop) => {
+      stopAltSpace = stop;
+    })
+    .catch((cause: unknown) => {
+      message.value = String(cause);
+    });
   void load();
 });
 
 onUnmounted(() => {
   menuObserver?.disconnect();
+  window.removeEventListener("keydown", onKeydown);
+  stopAltSpace?.();
 });
 </script>
 
