@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -23,18 +23,31 @@ pub struct SearchHit {
     pub path: PathBuf,
 }
 
-pub fn scan() -> Vec<AppEntry> {
+pub fn scan() -> Result<Vec<AppEntry>, String> {
+    let dirs = start_menu_dirs();
+    if dirs.is_empty() {
+        return Err("找不到开始菜单目录".to_string());
+    }
+    let mut saw_dir = false;
     let mut by_name = HashMap::new();
-    for dir in start_menu_dirs() {
-        collect(&dir, &mut by_name);
+    let mut seen = HashSet::new();
+    for dir in dirs {
+        if !dir.exists() {
+            continue;
+        }
+        saw_dir = true;
+        collect(&dir, &mut by_name, &mut seen, 0);
+    }
+    if !saw_dir {
+        return Err("开始菜单目录不存在".to_string());
     }
 
     let mut apps: Vec<AppEntry> = by_name.into_values().collect();
-    apps.sort_by(|a, b| a.folded.cmp(&b.folded));
+    apps.sort_by(|left, right| left.folded.cmp(&right.folded).then_with(|| left.path.cmp(&right.path)));
     for (id, app) in apps.iter_mut().enumerate() {
         app.id = id as u32;
     }
-    apps
+    Ok(apps)
 }
 
 pub fn search(apps: &[AppEntry], query: &str, limit: usize) -> Vec<SearchHit> {
@@ -43,14 +56,26 @@ pub fn search(apps: &[AppEntry], query: &str, limit: usize) -> Vec<SearchHit> {
         return Vec::new();
     }
 
-    let mut scored = Vec::new();
+    let mut best: Vec<(i32, &AppEntry)> = Vec::with_capacity(limit);
     for app in apps {
-        if let Some(value) = score(app, &query) {
-            scored.push((value, app));
+        let Some(value) = score(app, &query) else {
+            continue;
+        };
+        let ahead = best.iter().position(|(kept_score, kept)| {
+            value > *kept_score
+                || (value == *kept_score && app.folded < kept.folded)
+                || (value == *kept_score && app.folded == kept.folded && app.id < kept.id)
+        });
+        if let Some(index) = ahead {
+            best.insert(index, (value, app));
+            if best.len() > limit {
+                best.pop();
+            }
+        } else if best.len() < limit {
+            best.push((value, app));
         }
     }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.folded.cmp(&b.1.folded)));
-    scored.into_iter().take(limit).map(|(_, app)| hit(app)).collect()
+    best.into_iter().map(|(_, app)| hit(app)).collect()
 }
 
 pub fn open_link(path: &Path) -> Result<(), String> {
@@ -118,6 +143,7 @@ fn link_target(path: &Path) -> Option<PathBuf> {
     use windows::Win32::UI::Shell::{IShellLinkW, ShellLink, SLR_NO_UI};
 
     unsafe {
+        // 线程可能已经初始化过 COM。失败时仍尝试创建 ShellLink，已有的套间可以继续用。
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER).ok()?;
         let store: IPersistFile = link.cast().ok()?;
@@ -154,7 +180,14 @@ fn start_menu_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn collect(dir: &Path, into: &mut HashMap<String, AppEntry>) {
+fn collect(dir: &Path, into: &mut HashMap<String, AppEntry>, seen: &mut HashSet<PathBuf>, depth: u8) {
+    if depth > 12 {
+        return;
+    }
+    let identity = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !seen.insert(identity) {
+        return;
+    }
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(_) => return,
@@ -163,7 +196,7 @@ fn collect(dir: &Path, into: &mut HashMap<String, AppEntry>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect(&path, into);
+            collect(&path, into, seen, depth + 1);
             continue;
         }
         let is_link = path
@@ -287,6 +320,7 @@ pub fn icon_data_url(path: &Path) -> Option<String> {
 }
 
 fn file_icon_png(path: &Path) -> Option<Vec<u8>> {
+    // SHGetFileInfoW 给出的 HICON 由调用方负责销毁，编码失败时也不能漏掉。
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
@@ -315,6 +349,7 @@ fn file_icon_png(path: &Path) -> Option<Vec<u8>> {
 }
 
 unsafe fn hicon_to_png(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<Vec<u8>> {
+    // 屏幕 DC、内存 DC 和位图在每条返回路径上释放。图标句柄由 file_icon_png 销毁。
     use windows::Win32::Graphics::Gdi::{
         CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GetDC, ReleaseDC, SelectObject,
         BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
@@ -327,6 +362,12 @@ unsafe fn hicon_to_png(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> 
         return None;
     }
     let memory = unsafe { CreateCompatibleDC(Some(screen)) };
+    if memory.is_invalid() {
+        unsafe {
+            ReleaseDC(None, screen);
+        }
+        return None;
+    }
     let info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -427,7 +468,7 @@ mod tests {
 
     #[test]
     fn start_menu_shortcut_has_png_icon() {
-        let Some(app) = scan().into_iter().next() else {
+        let Some(app) = scan().ok().and_then(|apps| apps.into_iter().next()) else {
             return;
         };
         let icon = icon_data_url(&app.path).unwrap_or_else(|| panic!("没有图标: {}", app.name));
@@ -436,10 +477,126 @@ mod tests {
 
     #[test]
     fn shortcut_resolves_to_a_target() {
-        let Some(app) = scan().into_iter().next() else {
+        let Some(app) = scan().ok().and_then(|apps| apps.into_iter().next()) else {
             return;
         };
         let target = link_target(&app.path).unwrap_or_else(|| panic!("没有目标: {}", app.name));
         assert!(!target.as_os_str().is_empty());
+    }
+
+    fn apps(names: &[&str]) -> Vec<AppEntry> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(id, name)| {
+                let mut app = entry(name);
+                app.id = id as u32;
+                app
+            })
+            .collect()
+    }
+
+    #[test]
+    fn empty_and_blank_queries_return_nothing() {
+        let apps = apps(&["记事本"]);
+        assert!(search(&apps, "", 8).is_empty());
+        assert!(search(&apps, "   ", 8).is_empty());
+        assert!(search(&apps, "记事本", 0).is_empty());
+    }
+
+    #[test]
+    fn english_exact_and_prefix() {
+        let apps = apps(&["Notepad"]);
+        assert_eq!(search(&apps, "Notepad", 8)[0].name, "Notepad");
+        assert_eq!(search(&apps, "note", 8)[0].name, "Notepad");
+    }
+
+    #[test]
+    fn chinese_full_pinyin_and_initials() {
+        let apps = apps(&["微信"]);
+        assert_eq!(search(&apps, "微信", 8)[0].name, "微信");
+        assert_eq!(search(&apps, "weixin", 8)[0].name, "微信");
+        assert_eq!(search(&apps, "wx", 8)[0].name, "微信");
+    }
+
+    #[test]
+    fn mixed_name_matches_letters_and_pinyin() {
+        let apps = apps(&["QQ音乐"]);
+        let app = &apps[0];
+        assert!(
+            search(&apps, "qq", 8).iter().any(|hit| hit.name == "QQ音乐"),
+            "folded={} pinyin={} initials={}",
+            app.folded,
+            app.pinyin,
+            app.initials
+        );
+        assert!(
+            app.pinyin.contains("yin"),
+            "folded={} pinyin={} initials={}",
+            app.folded,
+            app.pinyin,
+            app.initials
+        );
+        assert!(search(&apps, "yin", 8).iter().any(|hit| hit.name == "QQ音乐"));
+    }
+
+    #[test]
+    fn contains_and_subsequence_match() {
+        let apps = apps(&["Visual Studio Code"]);
+        assert_eq!(search(&apps, "studio", 8)[0].name, "Visual Studio Code");
+        assert_eq!(search(&apps, "vscd", 8)[0].name, "Visual Studio Code");
+    }
+
+    #[test]
+    fn exact_name_ranks_ahead_of_a_longer_name() {
+        let hits = search(&apps(&["Visual Studio Code", "Code"]), "code", 8);
+        assert_eq!(hits[0].name, "Code");
+        assert_eq!(hits[1].name, "Visual Studio Code");
+    }
+
+    #[test]
+    fn limit_keeps_the_stable_name_order() {
+        let hits = search(&apps(&["Beta Note", "Alpha Note", "Alpine Note"]), "note", 2);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].name, "Alpha Note");
+        assert_eq!(hits[1].name, "Alpine Note");
+    }
+
+    #[test]
+    fn later_directory_replaces_duplicate_name() {
+        let root = std::env::temp_dir().join(format!("veery-scan-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let first = root.join("common");
+        let second = root.join("user");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(first.join("记事本.lnk"), b"").unwrap();
+        fs::write(second.join("记事本.lnk"), b"").unwrap();
+        let mut into = HashMap::new();
+        let mut seen = HashSet::new();
+        collect(&first, &mut into, &mut seen, 0);
+        collect(&second, &mut into, &mut seen, 0);
+        let app = into.get("记事本").unwrap();
+        assert!(app.path.starts_with(&second));
+        collect(&second, &mut into, &mut seen, 0);
+        assert_eq!(into.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn search_core_stays_within_a_few_milliseconds() {
+        let mut apps = Vec::new();
+        for id in 0..300 {
+            let mut app = entry(&format!("Program {id}"));
+            app.id = id;
+            apps.push(app);
+        }
+        let start = std::time::Instant::now();
+        for _ in 0..30 {
+            let _ = search(&apps, "pro", 8);
+        }
+        let average = start.elapsed() / 30;
+        eprintln!("veery search core average: {average:?}");
+        assert!(average.as_millis() < 20, "{average:?}");
     }
 }
