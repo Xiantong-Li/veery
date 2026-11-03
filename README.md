@@ -9,6 +9,10 @@
   <a href="https://github.com/Xiantong-Li/veery">GitHub</a>
   ·
   <a href="https://gitee.com/li-xiantong/veery">Gitee</a>
+  <br />
+  <a href="https://github.com/Xiantong-Li/veery/releases/latest">GitHub 下载安装版</a>
+  ·
+  <a href="https://gitee.com/li-xiantong/veery/releases/latest">码云下载安装版</a>
 </p>
 
 <h1 align="center">Veery</h1>
