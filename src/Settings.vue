@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import logo from "./assets/Veery-Log_compressed.png";
@@ -15,6 +15,11 @@ type SettingsInfo = {
 };
 
 const page = ref<"general" | "about">("general");
+const menuEl = ref<HTMLElement | null>(null);
+const generalEl = ref<HTMLButtonElement | null>(null);
+const aboutEl = ref<HTMLButtonElement | null>(null);
+const selectionReady = ref(false);
+const selection = ref({ y: 0, height: 0 });
 const info = ref<SettingsInfo | null>(null);
 const recording = ref(false);
 const message = ref("");
@@ -92,6 +97,17 @@ async function onKeydown(event: KeyboardEvent) {
   }
 }
 
+const selectionStyle = computed(() => ({
+  height: `${selection.value.height}px`,
+  transform: `translate3d(0, ${selection.value.y}px, 0)`,
+}));
+
+function moveSelection() {
+  const button = page.value === "general" ? generalEl.value : aboutEl.value;
+  if (!button) return;
+  selection.value = { y: button.offsetTop, height: button.offsetHeight };
+}
+
 function sameShortcut(next: string, current: string) {
   const token = (part: string) => {
     switch (part.trim().toUpperCase()) {
@@ -113,8 +129,24 @@ function sameShortcut(next: string, current: string) {
   return fold(next) === fold(current);
 }
 
+let menuObserver: ResizeObserver | null = null;
+
+watch(page, () => {
+  void nextTick(moveSelection);
+});
+
 onMounted(() => {
   window.addEventListener("keydown", onKeydown);
+  void nextTick(() => {
+    moveSelection();
+    requestAnimationFrame(() => {
+      selectionReady.value = true;
+    });
+  });
+  if (menuEl.value && typeof ResizeObserver !== "undefined") {
+    menuObserver = new ResizeObserver(() => moveSelection());
+    menuObserver.observe(menuEl.value);
+  }
   void listen<{ ctrl: boolean; shift: boolean; alt: boolean }>("alt-space", (event) => {
     if (!recording.value) return;
     const mods = event.payload;
@@ -131,18 +163,30 @@ onMounted(() => {
   });
   void load();
 });
+
+onUnmounted(() => {
+  menuObserver?.disconnect();
+});
 </script>
 
 <template>
   <main class="settings">
     <aside>
       <img class="brand" :src="logo" alt="Veery" />
-      <button type="button" :class="{ current: page === 'general' }" @click="page = 'general'">
-        常用设置
-      </button>
-      <button type="button" :class="{ current: page === 'about' }" @click="page = 'about'">
-        关于
-      </button>
+      <nav ref="menuEl" class="sidebar">
+        <span class="indicator" :class="{ ready: selectionReady }" :style="selectionStyle"></span>
+        <button
+          ref="generalEl"
+          type="button"
+          :class="{ current: page === 'general' }"
+          @click="page = 'general'"
+        >
+          常用设置
+        </button>
+        <button ref="aboutEl" type="button" :class="{ current: page === 'about' }" @click="page = 'about'">
+          关于
+        </button>
+      </nav>
     </aside>
     <section v-if="page === 'general'" class="panel">
       <h1>常用设置</h1>
@@ -228,7 +272,32 @@ aside {
   margin: 0 8px 18px;
 }
 
+.sidebar {
+  position: relative;
+}
+
+.indicator {
+  position: absolute;
+  z-index: 0;
+  left: 0;
+  right: 0;
+  top: 0;
+  border-radius: 8px;
+  background: #f3f3f3;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.indicator.ready {
+  opacity: 1;
+  transition:
+    transform 0.46s cubic-bezier(0.32, 0.72, 0, 1),
+    height 0.46s cubic-bezier(0.32, 0.72, 0, 1);
+}
+
 aside button {
+  position: relative;
+  z-index: 1;
   display: block;
   width: 100%;
   margin: 0 0 4px;
@@ -241,11 +310,18 @@ aside button {
   text-align: left;
   padding: 10px 12px;
   cursor: pointer;
+  transition: color 0.35s ease;
 }
 
 aside button.current {
-  background: #f3f3f3;
   color: #1a1a1a;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .indicator.ready,
+  aside button {
+    transition: none;
+  }
 }
 
 .panel {
