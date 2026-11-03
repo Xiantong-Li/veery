@@ -1,7 +1,7 @@
 mod catalog;
 mod settings;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -15,9 +15,15 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, SC_KEYMENU, WM_SYSCOMMAND};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
+struct IconCache {
+    ready: HashMap<PathBuf, String>,
+    pending: HashSet<PathBuf>,
+}
+
 struct AppState {
     index: Mutex<Vec<catalog::AppEntry>>,
-    icons: Mutex<HashMap<PathBuf, Option<String>>>,
+    index_ready: AtomicBool,
+    icons: Mutex<IconCache>,
     shown_at: Mutex<Instant>,
     shortcut: Mutex<String>,
     shortcut_item: Mutex<Option<MenuItem<Wry>>>,
@@ -85,6 +91,7 @@ unsafe extern "system" fn subclass_child(hwnd: HWND, _lparam: LPARAM) -> windows
 }
 
 fn guard_alt_space(window: &tauri::WebviewWindow) {
+    // 只拦设置窗口自己的 Alt+空格系统菜单，不改其他程序的快捷键。
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
             let _ = SetWindowSubclass(hwnd, Some(suppress_system_menu), 1, 0);
@@ -173,6 +180,22 @@ fn tune_webview(window: &tauri::WebviewWindow) {
     });
 }
 
+const LAUNCHER_WIDTH: f64 = 960.0;
+const LAUNCHER_IDLE_HEIGHT: f64 = 132.0;
+const LAUNCHER_OPEN_HEIGHT: f64 = 560.0;
+
+fn set_launcher_size(window: &tauri::WebviewWindow, height: f64) {
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let width_px = (LAUNCHER_WIDTH * scale).round() as u32;
+    let height_px = (height * scale).round() as u32;
+    if let Ok(size) = window.inner_size() {
+        if size.width == width_px && size.height == height_px {
+            return;
+        }
+    }
+    let _ = window.set_size(tauri::LogicalSize::new(LAUNCHER_WIDTH, height));
+}
+
 fn hide_launcher(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
@@ -182,21 +205,29 @@ fn hide_launcher(app: &AppHandle) {
     }
     let _ = window.hide();
     let _ = window.emit("hidden", ());
-    set_memory_level(&window, true);
+    set_launcher_size(&window, LAUNCHER_IDLE_HEIGHT);
 }
 
-fn place_launcher(window: &tauri::WebviewWindow) {
+fn place_launcher(window: &tauri::WebviewWindow, height: f64) {
     let Ok(Some(monitor)) = window.current_monitor() else {
         let _ = window.center();
         return;
     };
     let area = monitor.work_area();
-    let Ok(size) = window.outer_size() else {
-        let _ = window.center();
-        return;
-    };
-    let x = area.position.x + (area.size.width as i32 - size.width as i32) / 2;
-    let y = area.position.y + (area.size.height as f64 * 0.18) as i32;
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let width = ((LAUNCHER_WIDTH * scale).round() as u32).min(area.size.width);
+    let height_px = ((height * scale).round() as u32).min(area.size.height);
+    if let Ok(size) = window.inner_size() {
+        if size.width != width || size.height != height_px {
+            let _ = window.set_size(tauri::PhysicalSize::new(width, height_px));
+        }
+    }
+    let max_x = area.position.x + area.size.width as i32 - width as i32;
+    let max_y = area.position.y + area.size.height as i32 - height_px as i32;
+    let x = (area.position.x + (area.size.width as i32 - width as i32) / 2)
+        .clamp(area.position.x, max_x.max(area.position.x));
+    let y = (area.position.y + (area.size.height as f64 * 0.18) as i32)
+        .clamp(area.position.y, max_y.max(area.position.y));
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
@@ -206,8 +237,17 @@ fn show_launcher(app: &AppHandle) {
     };
     mark_shown(app);
     set_memory_level(&window, false);
-    let _ = window.set_size(tauri::LogicalSize::new(960.0, 132.0));
-    place_launcher(&window);
+    let open_height = {
+        let cap = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .map(|monitor| monitor.work_area().size.height as f64 / window.scale_factor().unwrap_or(1.0))
+            .unwrap_or(LAUNCHER_OPEN_HEIGHT);
+        LAUNCHER_OPEN_HEIGHT.min(cap)
+    };
+    set_launcher_size(&window, open_height);
+    place_launcher(&window, open_height);
     let _ = window.show();
     let _ = window.unminimize();
     let _ = window.set_focus();
@@ -327,20 +367,106 @@ fn install_tray(app: &tauri::App, shortcut_label: &str) -> tauri::Result<()> {
     Ok(())
 }
 
+#[derive(serde::Serialize)]
+struct SearchResponse {
+    ready: bool,
+    hits: Vec<catalog::SearchHit>,
+}
+
 #[tauri::command]
-fn search(state: tauri::State<AppState>, query: String) -> Vec<catalog::SearchHit> {
+fn search(state: tauri::State<AppState>, query: String) -> SearchResponse {
+    if !state.index_ready.load(Ordering::Acquire) {
+        return SearchResponse {
+            ready: false,
+            hits: Vec::new(),
+        };
+    }
     let mut hits = {
         let apps = state.index.lock().unwrap_or_else(|error| error.into_inner());
         catalog::search(&apps, &query, 8)
     };
-    let mut icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
-    for hit in &mut hits {
-        hit.icon = icons
-            .entry(hit.path.clone())
-            .or_insert_with(|| catalog::icon_data_url(&hit.path))
-            .clone();
+    attach_icons(&state, &mut hits);
+    SearchResponse { ready: true, hits }
+}
+
+fn attach_icons(state: &AppState, hits: &mut [catalog::SearchHit]) {
+    let mut missing = Vec::new();
+    {
+        let mut icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
+        for hit in hits.iter_mut() {
+            if let Some(icon) = icons.ready.get(&hit.path) {
+                hit.icon = Some(icon.clone());
+            } else if icons.pending.insert(hit.path.clone()) {
+                missing.push(hit.path.clone());
+            }
+        }
     }
-    hits
+    let extracted: Vec<_> = missing
+        .into_iter()
+        .map(|path| {
+            let icon = catalog::icon_data_url(&path);
+            (path, icon)
+        })
+        .collect();
+    let mut icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
+    for (path, icon) in extracted {
+        icons.pending.remove(&path);
+        if let Some(icon) = icon {
+            icons.ready.insert(path, icon);
+        }
+    }
+    if icons.ready.len() > 512 {
+        let keep: HashSet<_> = hits.iter().map(|hit| hit.path.clone()).collect();
+        icons.ready.retain(|path, _| keep.contains(path));
+    }
+    for hit in hits.iter_mut() {
+        if hit.icon.is_none() {
+            hit.icon = icons.ready.get(&hit.path).cloned();
+        }
+    }
+}
+
+fn store_catalog(state: &AppState, scanned: Result<Vec<catalog::AppEntry>, String>) {
+    match scanned {
+        Ok(apps) => {
+            let paths: HashSet<_> = apps.iter().map(|app| app.path.clone()).collect();
+            {
+                let mut index = state.index.lock().unwrap_or_else(|error| error.into_inner());
+                *index = apps;
+            }
+            state.index_ready.store(true, Ordering::Release);
+            let mut icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
+            icons.ready.retain(|path, _| paths.contains(path));
+            icons.pending.retain(|path| paths.contains(path));
+        }
+        Err(error) => {
+            eprintln!("veery: 索引扫描失败，继续使用上一份索引: {error}");
+            if !state.index_ready.load(Ordering::Acquire) {
+                state.index_ready.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
+fn reload_catalog(app: &AppHandle) {
+    let scanned = catalog::scan();
+    if let Ok(apps) = scanned.as_ref() {
+        eprintln!("veery: 已索引 {} 个开始菜单程序", apps.len());
+    }
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    store_catalog(&state, scanned);
+    let _ = app.emit("catalog-ready", ());
+}
+
+#[tauri::command]
+fn refresh_index(app: AppHandle) {
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("veery-index".into())
+        .spawn(move || reload_catalog(&app))
+        .ok();
 }
 
 fn path_for(state: &AppState, id: u32) -> Result<PathBuf, String> {
@@ -421,7 +547,11 @@ fn set_shortcut(app: AppHandle, shortcut: String) -> Result<String, String> {
         let _ = register_shortcut(&app, &previous);
         return Err(format!("没有注册成功: {error}"));
     }
-    settings::save_shortcut(&app, &shortcut)?;
+    if let Err(error) = settings::save_shortcut(&app, &shortcut) {
+        let _ = app.global_shortcut().unregister_all();
+        let _ = register_shortcut(&app, &previous);
+        return Err(error);
+    }
     remember_shortcut(&app, &shortcut);
     Ok(settings::shortcut_label(&shortcut))
 }
@@ -430,6 +560,7 @@ fn set_shortcut(app: AppHandle, shortcut: String) -> Result<String, String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            // 主窗口隐藏时进程仍在，再次启动只唤醒这一份，不重复注册快捷键。
             show_launcher(app);
         }))
         .plugin(
@@ -445,7 +576,11 @@ pub fn run() {
             let shortcut = settings::load_shortcut(app.handle());
             app.manage(AppState {
                 index: Mutex::new(Vec::new()),
-                icons: Mutex::new(HashMap::new()),
+                index_ready: AtomicBool::new(false),
+                icons: Mutex::new(IconCache {
+                    ready: HashMap::new(),
+                    pending: HashSet::new(),
+                }),
                 shown_at: Mutex::new(Instant::now() - Duration::from_secs(60)),
                 shortcut: Mutex::new(shortcut.clone()),
                 shortcut_item: Mutex::new(None),
@@ -453,14 +588,7 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::Builder::new()
                 .name("veery-index".into())
-                .spawn(move || {
-                    let apps = catalog::scan();
-                    eprintln!("veery: 已索引 {} 个开始菜单程序", apps.len());
-                    if let Some(state) = handle.try_state::<AppState>() {
-                        let mut index = state.index.lock().unwrap_or_else(|error| error.into_inner());
-                        *index = apps;
-                    }
-                })
+                .spawn(move || reload_catalog(&handle))
                 .ok();
             let registered = if register_shortcut(app.handle(), &shortcut).is_ok() {
                 shortcut
@@ -483,16 +611,6 @@ pub fn run() {
             }
             if let Some(window) = app.get_webview_window("main") {
                 tune_webview(&window);
-                let handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_secs(2));
-                    let Some(window) = handle.get_webview_window("main") else {
-                        return;
-                    };
-                    if !window.is_visible().unwrap_or(false) {
-                        set_memory_level(&window, true);
-                    }
-                });
             }
             Ok(())
         })
@@ -532,6 +650,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             search,
+            refresh_index,
             launch,
             launch_admin,
             reveal,

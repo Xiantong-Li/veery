@@ -24,7 +24,7 @@
         "noRedirectionBitmap": true,
         "dragDropEnabled": false,
         "dataDirectory": "webview",
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,BackForwardCache,AudioServiceOutOfProcess,TranslateUI,CalculateNativeWinOcclusion --disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --disable-extensions --disable-default-apps --disable-breakpad --metrics-recording-only --no-first-run --renderer-process-limit=1 --disk-cache-size=1 --media-cache-size=1 --disable-gpu-shader-disk-cache",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,BackForwardCache,AudioServiceOutOfProcess,TranslateUI,CalculateNativeWinOcclusion --disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --disable-extensions --disable-default-apps --disable-breakpad --metrics-recording-only --no-first-run --renderer-process-limit=1 --disk-cache-size=1 --media-cache-size=1",
         "center": true,
         "skipTaskbar": true,
         "alwaysOnTop": true,
@@ -33,7 +33,7 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": "default-src 'self'; img-src 'self' data: asset: http://asset.localhost blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self' ipc: http://ipc.localhost http://localhost:1420 ws://localhost:1421"
     }
   },
   "bundle": {
