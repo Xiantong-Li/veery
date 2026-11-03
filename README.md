@@ -6,6 +6,9 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Windows" />
   <img src="https://img.shields.io/badge/version-0.1.0-lightgrey" alt="version 0.1.0" />
+  <a href="https://github.com/Xiantong-Li/veery">GitHub</a>
+  ·
+  <a href="https://gitee.com/li-xiantong/veery">Gitee</a>
 </p>
 
 <h1 align="center">Veery</h1>
