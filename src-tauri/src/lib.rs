@@ -191,6 +191,8 @@ fn tune_webview(window: &tauri::WebviewWindow) {
 const LAUNCHER_WIDTH: f64 = 960.0;
 const LAUNCHER_IDLE_HEIGHT: f64 = 132.0;
 const LAUNCHER_OPEN_HEIGHT: f64 = 560.0;
+// 搜索条停在工作区上方，比贴顶再低一截。
+const LAUNCHER_TOP_RATIO: f64 = 0.26;
 
 fn set_launcher_size(window: &tauri::WebviewWindow, height: f64) {
     let scale = window.scale_factor().unwrap_or(1.0);
@@ -216,6 +218,29 @@ fn hide_launcher(app: &AppHandle) {
     set_launcher_size(&window, LAUNCHER_IDLE_HEIGHT);
 }
 
+fn close_before(
+    window: &tauri::WebviewWindow,
+    action: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    // 先关掉搜索条，再去做可能要等一会儿的启动。失败时再把原来的结果拿回来。
+    let app = window.app_handle().clone();
+    let _ = window.hide();
+    match action() {
+        Ok(()) => {
+            let _ = window.emit("hidden", ());
+            set_launcher_size(window, LAUNCHER_IDLE_HEIGHT);
+            Ok(())
+        }
+        Err(error) => {
+            mark_shown(&app);
+            let _ = window.show();
+            let _ = window.unminimize();
+            let _ = window.set_focus();
+            Err(error)
+        }
+    }
+}
+
 fn place_launcher(window: &tauri::WebviewWindow, height: f64) {
     let Ok(Some(monitor)) = window.current_monitor() else {
         let _ = window.center();
@@ -234,7 +259,7 @@ fn place_launcher(window: &tauri::WebviewWindow, height: f64) {
     let max_y = area.position.y + area.size.height as i32 - height_px as i32;
     let x = (area.position.x + (area.size.width as i32 - width as i32) / 2)
         .clamp(area.position.x, max_x.max(area.position.x));
-    let y = (area.position.y + (area.size.height as f64 * 0.18) as i32)
+    let y = (area.position.y + (area.size.height as f64 * LAUNCHER_TOP_RATIO) as i32)
         .clamp(area.position.y, max_y.max(area.position.y));
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
@@ -542,10 +567,10 @@ fn path_for(state: &AppState, id: u32) -> Result<PathBuf, String> {
 
 #[tauri::command]
 fn launch(window: tauri::WebviewWindow, state: tauri::State<AppState>, id: u32) -> Result<(), String> {
-    let path = path_for(&state, id)?;
-    catalog::open_link(&path)?;
-    hide_launcher(window.app_handle());
-    Ok(())
+    close_before(&window, || {
+        let path = path_for(&state, id)?;
+        catalog::open_link(&path)
+    })
 }
 
 #[tauri::command]
@@ -554,18 +579,18 @@ fn launch_admin(
     state: tauri::State<AppState>,
     id: u32,
 ) -> Result<(), String> {
-    let path = path_for(&state, id)?;
-    catalog::open_elevated(&path)?;
-    hide_launcher(window.app_handle());
-    Ok(())
+    close_before(&window, || {
+        let path = path_for(&state, id)?;
+        catalog::open_elevated(&path)
+    })
 }
 
 #[tauri::command]
 fn reveal(window: tauri::WebviewWindow, state: tauri::State<AppState>, id: u32) -> Result<(), String> {
-    let path = path_for(&state, id)?;
-    catalog::reveal(&path)?;
-    hide_launcher(window.app_handle());
-    Ok(())
+    close_before(&window, || {
+        let path = path_for(&state, id)?;
+        catalog::reveal(&path)
+    })
 }
 
 #[tauri::command]
