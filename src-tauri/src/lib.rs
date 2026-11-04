@@ -1,5 +1,6 @@
 mod catalog;
 mod settings;
+mod update;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -20,13 +21,20 @@ struct IconCache {
     pending: HashSet<PathBuf>,
 }
 
+struct TrayItems {
+    show: MenuItem<Wry>,
+    settings: MenuItem<Wry>,
+    shortcut: MenuItem<Wry>,
+    quit: MenuItem<Wry>,
+}
+
 struct AppState {
     index: Mutex<Vec<catalog::AppEntry>>,
     index_ready: AtomicBool,
     icons: Mutex<IconCache>,
     shown_at: Mutex<Instant>,
     shortcut: Mutex<String>,
-    shortcut_item: Mutex<Option<MenuItem<Wry>>>,
+    tray: Mutex<Option<TrayItems>>,
 }
 
 fn mark_shown(app: &AppHandle) {
@@ -231,27 +239,46 @@ fn place_launcher(window: &tauri::WebviewWindow, height: f64) {
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
 
+fn launcher_open_height(window: &tauri::WebviewWindow) -> f64 {
+    let cap = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|monitor| monitor.work_area().size.height as f64 / window.scale_factor().unwrap_or(1.0))
+        .unwrap_or(LAUNCHER_OPEN_HEIGHT);
+    LAUNCHER_OPEN_HEIGHT.min(cap)
+}
+
 fn show_launcher(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else {
         return;
     };
     mark_shown(app);
     set_memory_level(&window, false);
-    let open_height = {
-        let cap = window
-            .current_monitor()
-            .ok()
-            .flatten()
-            .map(|monitor| monitor.work_area().size.height as f64 / window.scale_factor().unwrap_or(1.0))
-            .unwrap_or(LAUNCHER_OPEN_HEIGHT);
-        LAUNCHER_OPEN_HEIGHT.min(cap)
-    };
-    set_launcher_size(&window, open_height);
-    place_launcher(&window, open_height);
+    // 唤出时只显示搜索条。列表区域留到真正展开时再加，避免空窗口被截得很高。
+    set_launcher_size(&window, LAUNCHER_IDLE_HEIGHT);
+    place_launcher(&window, LAUNCHER_IDLE_HEIGHT);
     let _ = window.show();
     let _ = window.unminimize();
     let _ = window.set_focus();
     let _ = window.emit("shown", ());
+}
+
+fn keep_launcher_on_screen(window: &tauri::WebviewWindow, height: f64) {
+    let Ok(Some(monitor)) = window.current_monitor() else {
+        return;
+    };
+    let Ok(position) = window.outer_position() else {
+        return;
+    };
+    let area = monitor.work_area();
+    let scale = window.scale_factor().unwrap_or(1.0);
+    let height_px = ((height * scale).round() as u32).min(area.size.height);
+    let bottom = area.position.y + area.size.height as i32;
+    let y = position.y.min(bottom - height_px as i32).max(area.position.y);
+    if y != position.y {
+        let _ = window.set_position(PhysicalPosition::new(position.x, y));
+    }
 }
 
 fn toggle_launcher(app: &AppHandle) {
@@ -272,14 +299,41 @@ fn remember_shortcut(app: &AppHandle, shortcut: &str) {
     if let Ok(mut current) = state.shortcut.lock() {
         *current = shortcut.to_string();
     }
-    let label = settings::shortcut_label(shortcut);
-    if let Ok(item) = state.shortcut_item.lock() {
-        if let Some(item) = item.as_ref() {
-            let _ = item.set_text(&label);
+    apply_tray(app);
+}
+
+fn apply_tray(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let english = settings::load(app).language == "en";
+    let shortcut = state
+        .shortcut
+        .lock()
+        .ok()
+        .map(|shortcut| shortcut.clone())
+        .unwrap_or_else(|| settings::DEFAULT_SHORTCUT.to_string());
+    let label = settings::shortcut_label(&shortcut, english);
+    if let Ok(tray) = state.tray.lock() {
+        if let Some(tray) = tray.as_ref() {
+            let _ = tray.show.set_text(if english { "Show" } else { "显示" });
+            let _ = tray
+                .settings
+                .set_text(if english { "Settings" } else { "设置" });
+            let _ = tray.shortcut.set_text(&label);
+            let _ = tray.quit.set_text(if english { "Quit" } else { "退出" });
         }
     }
     if let Some(tray) = app.tray_by_id("tray") {
         let _ = tray.set_tooltip(Some(format!("Veery · {label}")));
+    }
+}
+
+fn settings_title(app: &AppHandle) -> &'static str {
+    if settings::load(app).language == "en" {
+        "Settings"
+    } else {
+        "设置"
     }
 }
 
@@ -314,7 +368,7 @@ fn show_settings(app: &AppHandle) {
         .map(|dir| dir.join("settings"))
         .unwrap_or_else(|_| PathBuf::from("settings"));
     if let Err(error) = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
-        .title("设置")
+        .title(settings_title(app))
         .inner_size(760.0, 520.0)
         .center()
         .focused(true)
@@ -332,20 +386,25 @@ fn show_settings(app: &AppHandle) {
     }
 }
 
-fn install_tray(app: &tauri::App, shortcut_label: &str) -> tauri::Result<()> {
+fn install_tray(app: &tauri::App) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", "显示", true, None::<&str>)?;
     let settings_item = MenuItem::with_id(app, "settings", "设置", true, None::<&str>)?;
-    let shortcut = MenuItem::with_id(app, "shortcut", shortcut_label, false, None::<&str>)?;
+    let shortcut = MenuItem::with_id(app, "shortcut", "", false, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &settings_item, &shortcut, &quit])?;
     if let Some(state) = app.try_state::<AppState>() {
-        if let Ok(mut slot) = state.shortcut_item.lock() {
-            *slot = Some(shortcut);
+        if let Ok(mut slot) = state.tray.lock() {
+            *slot = Some(TrayItems {
+                show,
+                settings: settings_item,
+                shortcut,
+                quit,
+            });
         }
     }
     let tray = TrayIconBuilder::with_id("tray")
         .icon(tauri::include_image!("icons/32x32.png"))
-        .tooltip(format!("Veery · {shortcut_label}"))
+        .tooltip("Veery")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_launcher(app),
@@ -364,6 +423,7 @@ fn install_tray(app: &tauri::App, shortcut_label: &str) -> tauri::Result<()> {
             }
         });
     tray.build(app)?;
+    apply_tray(app.handle());
     Ok(())
 }
 
@@ -514,9 +574,70 @@ fn hide_window(window: tauri::WebviewWindow) {
 }
 
 #[tauri::command]
+fn set_launcher_open(window: tauri::WebviewWindow, open: bool) {
+    if window.label() != "main" {
+        return;
+    }
+    let height = if open {
+        launcher_open_height(&window)
+    } else {
+        LAUNCHER_IDLE_HEIGHT
+    };
+    set_launcher_size(&window, height);
+    if open {
+        keep_launcher_on_screen(&window, height);
+    }
+}
+
+#[tauri::command]
 fn get_settings(app: AppHandle) -> settings::SettingsInfo {
-    let shortcut = saved_shortcut(&app);
-    settings::info(settings::autostart_enabled(), &shortcut)
+    let mut prefs = settings::load(&app);
+    prefs.shortcut = saved_shortcut(&app);
+    settings::info(settings::autostart_enabled(), &prefs)
+}
+
+#[tauri::command]
+fn set_language(app: AppHandle, language: String) -> Result<(), String> {
+    let theme = settings::load(&app).theme;
+    let prefs = settings::save_appearance(&app, &language, &theme)?;
+    apply_tray(&app);
+    if let Some(window) = app.get_webview_window("settings") {
+        let _ = window.set_title(settings_title(&app));
+    }
+    let _ = app.emit(
+        "appearance",
+        serde_json::json!({ "language": prefs.language, "theme": prefs.theme }),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+fn set_search_hint(app: AppHandle, hint: String) -> Result<String, String> {
+    settings::save_hint(&app, &hint)
+}
+
+#[tauri::command]
+fn set_theme(app: AppHandle, theme: String) -> Result<(), String> {
+    let language = settings::load(&app).language;
+    let prefs = settings::save_appearance(&app, &language, &theme)?;
+    let _ = app.emit(
+        "appearance",
+        serde_json::json!({ "language": prefs.language, "theme": prefs.theme }),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_update() -> Result<update::UpdateInfo, String> {
+    let current = env!("CARGO_PKG_VERSION").to_string();
+    tauri::async_runtime::spawn_blocking(move || update::check(&current))
+        .await
+        .map_err(|_| "offline".to_string())?
+}
+
+#[tauri::command]
+fn open_link(url: String) -> Result<(), String> {
+    settings::open_link(&url)
 }
 
 #[tauri::command]
@@ -553,7 +674,8 @@ fn set_shortcut(app: AppHandle, shortcut: String) -> Result<String, String> {
         return Err(error);
     }
     remember_shortcut(&app, &shortcut);
-    Ok(settings::shortcut_label(&shortcut))
+    let english = settings::load(&app).language == "en";
+    Ok(settings::shortcut_label(&shortcut, english))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -583,16 +705,14 @@ pub fn run() {
                 }),
                 shown_at: Mutex::new(Instant::now() - Duration::from_secs(60)),
                 shortcut: Mutex::new(shortcut.clone()),
-                shortcut_item: Mutex::new(None),
+                tray: Mutex::new(None),
             });
             let handle = app.handle().clone();
             std::thread::Builder::new()
                 .name("veery-index".into())
                 .spawn(move || reload_catalog(&handle))
                 .ok();
-            let registered = if register_shortcut(app.handle(), &shortcut).is_ok() {
-                shortcut
-            } else {
+            if register_shortcut(app.handle(), &shortcut).is_err() {
                 let fallback = settings::DEFAULT_SHORTCUT.to_string();
                 let _ = register_shortcut(app.handle(), &fallback);
                 if let Ok(mut current) = app
@@ -601,12 +721,10 @@ pub fn run() {
                     .shortcut
                     .lock()
                 {
-                    *current = fallback.clone();
+                    *current = fallback;
                 }
-                fallback
-            };
-            let shortcut_label = settings::shortcut_label(&registered);
-            if let Err(error) = install_tray(app, &shortcut_label) {
+            }
+            if let Err(error) = install_tray(app) {
                 eprintln!("veery: 托盘创建失败: {error}");
             }
             if let Some(window) = app.get_webview_window("main") {
@@ -655,8 +773,14 @@ pub fn run() {
             launch_admin,
             reveal,
             hide_window,
+            set_launcher_open,
             get_settings,
             set_autostart,
+            set_language,
+            set_search_hint,
+            set_theme,
+            check_update,
+            open_link,
             pause_shortcut,
             restore_shortcut,
             set_shortcut

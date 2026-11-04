@@ -1,5 +1,7 @@
 import { createApp } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { applyTheme, languageOf, prefsKey, themeOf, type SettingsInfo } from "./prefs";
 
 function isSettingsWindow() {
   try {
@@ -9,12 +11,19 @@ function isSettingsWindow() {
   }
 }
 
-if (isSettingsWindow()) {
-  void import("./Settings.vue").then(({ default: Settings }) => {
-    createApp(Settings).mount("#app");
-  });
-} else {
-  void import("./App.vue").then(({ default: App }) => {
-    createApp(App).mount("#app");
-  });
+async function boot() {
+  const settings = isSettingsWindow();
+  const [page, prefs] = await Promise.all([
+    settings ? import("./Settings.vue") : import("./App.vue"),
+    invoke<SettingsInfo>("get_settings").catch(() => null),
+  ]);
+  if (prefs) {
+    applyTheme(themeOf(prefs.theme));
+    document.documentElement.lang = languageOf(prefs.language);
+  }
+  const app = createApp(page.default);
+  app.provide(prefsKey, prefs);
+  app.mount("#app");
 }
+
+void boot();

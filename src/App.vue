@@ -1,10 +1,27 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
+import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  applyTheme,
+  copy,
+  languageOf,
+  prefsKey,
+  themeOf,
+  watchSystemTheme,
+  type Language,
+  type ThemeChoice,
+} from "./prefs";
 
 type Hit = { id: number; name: string; icon: string | null };
 type SearchBody = { ready: boolean; hits: Hit[] };
+
+const initial = inject(prefsKey, null);
+const language = ref<Language>(languageOf(initial?.language));
+const theme = ref<ThemeChoice>(themeOf(initial?.theme));
+const t = computed(() => copy(language.value));
+const hint = ref(initial?.hint ?? "");
+const placeholder = computed(() => hint.value || t.value.search);
 
 const query = ref("");
 const results = ref<Hit[]>([]);
@@ -16,6 +33,10 @@ const inputEl = ref<HTMLInputElement | null>(null);
 const sheetEl = ref<HTMLElement | null>(null);
 const menuEl = ref<HTMLElement | null>(null);
 const menu = ref<{ id: number; x: number; y: number } | null>(null);
+const hintMenuEl = ref<HTMLElement | null>(null);
+const hintInputEl = ref<HTMLInputElement | null>(null);
+const hintMenu = ref<{ x: number; y: number; editing: boolean } | null>(null);
+const hintDraft = ref("");
 let request = 0;
 
 const settled = computed(() => query.value.trim() !== "" && answered.value === query.value);
@@ -28,10 +49,19 @@ const drawerOpen = computed(
 
 let searchTimer = 0;
 
+watch(
+  drawerOpen,
+  (open) => {
+    void invoke("set_launcher_open", { open }).catch(() => undefined);
+  },
+  { flush: "sync" },
+);
+
 function scheduleRefresh() {
   window.clearTimeout(searchTimer);
   const text = query.value;
   menu.value = null;
+  hintMenu.value = null;
   if (!text.trim()) {
     request += 1;
     results.value = [];
@@ -91,40 +121,89 @@ function openMenu(index: number, event: MouseEvent) {
   const hit = results.value[index];
   if (!hit) return;
   selected.value = index;
+  hintMenu.value = null;
   menu.value = { id: hit.id, x: event.clientX, y: event.clientY };
   void placeMenu();
+}
+
+function openHintMenu(event: MouseEvent) {
+  menu.value = null;
+  hintDraft.value = hint.value;
+  hintMenu.value = { x: event.clientX, y: event.clientY, editing: false };
+  void placeHintMenu();
+}
+
+async function beginHintEdit() {
+  if (!hintMenu.value) return;
+  hintDraft.value = hint.value;
+  hintMenu.value = { ...hintMenu.value, editing: true };
+  await nextTick();
+  hintInputEl.value?.focus();
+  hintInputEl.value?.select();
+  await placeHintMenu();
+}
+
+async function writeHint(next: string) {
+  const previous = hint.value;
+  hint.value = next.trim();
+  hintMenu.value = null;
+  try {
+    hint.value = await invoke<string>("set_search_hint", { hint: hint.value });
+  } catch (cause) {
+    hint.value = previous;
+    error.value = String(cause);
+  }
+  void focusInput();
+}
+
+function closeHintMenu() {
+  hintMenu.value = null;
+  void focusInput();
+}
+
+function onHintMenuMouseDown(event: MouseEvent) {
+  if (hintMenu.value?.editing) return;
+  event.preventDefault();
 }
 
 function onPointerDown(event: PointerEvent) {
   const target = event.target;
   if (!(target instanceof Node)) return;
-  if (menuEl.value?.contains(target)) return;
+  if (menuEl.value?.contains(target) || hintMenuEl.value?.contains(target)) return;
   if (sheetEl.value?.contains(target)) {
-    if (!menu.value || event.button === 2) return;
+    if (event.button === 2) return;
     menu.value = null;
+    hintMenu.value = null;
     return;
   }
   void invoke("hide_window");
 }
 
-async function placeMenu() {
+async function placeAt(node: HTMLElement | null, point: { x: number; y: number } | null) {
   await nextTick();
-  const node = menuEl.value;
-  if (!node || !menu.value) return;
+  if (!node || !point) return null;
   const margin = 12;
-  let x = menu.value.x;
-  let y = menu.value.y;
+  let x = point.x;
+  let y = point.y;
   if (x + node.offsetWidth > window.innerWidth - margin) {
     x = window.innerWidth - node.offsetWidth - margin;
   }
   if (y + node.offsetHeight > window.innerHeight - margin) {
-    y = menu.value.y - node.offsetHeight;
+    y = point.y - node.offsetHeight;
   }
-  menu.value = {
-    id: menu.value.id,
-    x: Math.max(margin, x),
-    y: Math.max(margin, y),
-  };
+  return { x: Math.max(margin, x), y: Math.max(margin, y) };
+}
+
+async function placeMenu() {
+  const placed = await placeAt(menuEl.value, menu.value);
+  if (!placed || !menu.value) return;
+  menu.value = { id: menu.value.id, x: placed.x, y: placed.y };
+}
+
+async function placeHintMenu() {
+  const placed = await placeAt(hintMenuEl.value, hintMenu.value);
+  if (!placed || !hintMenu.value) return;
+  hintMenu.value = { ...hintMenu.value, x: placed.x, y: placed.y };
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -142,8 +221,9 @@ function onKeydown(event: KeyboardEvent) {
     void openSelected();
   } else if (event.key === "Escape") {
     event.preventDefault();
-    if (menu.value) {
+    if (menu.value || hintMenu.value) {
       menu.value = null;
+      hintMenu.value = null;
       return;
     }
     void invoke("hide_window");
@@ -157,6 +237,7 @@ async function focusInput() {
 }
 
 const stops: UnlistenFn[] = [];
+let stopThemeWatch: (() => void) | null = null;
 
 onMounted(async () => {
   window.addEventListener("pointerdown", onPointerDown);
@@ -170,6 +251,7 @@ onMounted(async () => {
         answered.value = "";
         indexing.value = false;
         menu.value = null;
+        hintMenu.value = null;
         await focusInput();
       }),
     );
@@ -182,6 +264,7 @@ onMounted(async () => {
         answered.value = "";
         indexing.value = false;
         menu.value = null;
+        hintMenu.value = null;
       }),
     );
     stops.push(
@@ -193,9 +276,18 @@ onMounted(async () => {
         if (query.value.trim()) scheduleRefresh();
       }),
     );
+    stops.push(
+      await listen<{ language: string; theme: string }>("appearance", (event) => {
+        language.value = languageOf(event.payload.language);
+        theme.value = themeOf(event.payload.theme);
+        applyTheme(theme.value);
+        document.documentElement.lang = language.value;
+      }),
+    );
   } catch (cause) {
     error.value = String(cause);
   }
+  stopThemeWatch = watchSystemTheme(() => theme.value);
   await focusInput();
 });
 
@@ -203,6 +295,7 @@ onUnmounted(() => {
   window.clearTimeout(searchTimer);
   window.removeEventListener("pointerdown", onPointerDown);
   for (const stop of stops) stop();
+  stopThemeWatch?.();
 });
 </script>
 
@@ -214,9 +307,10 @@ onUnmounted(() => {
         v-model="query"
         class="query"
         spellcheck="false"
-        placeholder="搜索"
+        :placeholder="placeholder"
         @input="scheduleRefresh"
         @keydown="onKeydown"
+        @contextmenu.prevent="openHintMenu"
       />
       <div class="drawer" :class="{ open: drawerOpen }">
         <div>
@@ -237,8 +331,8 @@ onUnmounted(() => {
           </button>
             </li>
           </ul>
-          <p v-else-if="indexing" class="note">正在读取开始菜单</p>
-          <p v-else-if="settled" class="note">没有匹配的程序</p>
+          <p v-else-if="indexing" class="note">{{ t.indexing }}</p>
+          <p v-else-if="settled" class="note">{{ t.empty }}</p>
         </div>
       </div>
     </section>
@@ -250,9 +344,33 @@ onUnmounted(() => {
       @mousedown.prevent
       @contextmenu.prevent
     >
-      <button type="button" @click="act('launch', menu.id)">打开</button>
-      <button type="button" @click="act('launch_admin', menu.id)">以管理员身份运行</button>
-      <button type="button" @click="act('reveal', menu.id)">打开所在文件夹</button>
+      <button type="button" @click="act('launch', menu.id)">{{ t.open }}</button>
+      <button type="button" @click="act('launch_admin', menu.id)">{{ t.admin }}</button>
+      <button type="button" @click="act('reveal', menu.id)">{{ t.folder }}</button>
+    </div>
+    <div
+      v-if="hintMenu"
+      ref="hintMenuEl"
+      class="menu"
+      :style="{ left: `${hintMenu.x}px`, top: `${hintMenu.y}px` }"
+      @mousedown="onHintMenuMouseDown"
+      @contextmenu.prevent
+    >
+      <input
+        v-if="hintMenu.editing"
+        ref="hintInputEl"
+        v-model="hintDraft"
+        class="hint-input"
+        maxlength="20"
+        spellcheck="false"
+        :placeholder="t.search"
+        @keydown.enter.prevent="writeHint(hintDraft)"
+        @keydown.escape.prevent="closeHintMenu"
+      />
+      <template v-else>
+        <button type="button" @click="beginHintEdit">{{ t.customizeHint }}</button>
+        <button v-if="hint" type="button" @click="writeHint('')">{{ t.resetHint }}</button>
+      </template>
     </div>
   </main>
 </template>
@@ -264,12 +382,52 @@ body,
   margin: 0;
   background: transparent;
   overflow: hidden;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --sheet: #2c2c2c;
+  --query: #d0d0d0;
+  --caret: #d0d0d0;
+  --line: #3a3a3a;
+  --result: #bdbdbd;
+  --result-active: #f3f3f3;
+  --result-bg: #3a3a3a;
+  --note: #9a9a9a;
+  --icon-bg: #3a3a3a;
+  --menu-bg: #2c2c2c;
+  --menu-text: #f3f3f3;
+  --menu-hover: #3a3a3a;
+  --error: #ffb4ab;
+  --shadow:
+    0 2px 6px rgba(0, 0, 0, 0.3),
+    0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+html[data-theme="light"],
+html:not([data-theme]) {
   color-scheme: light;
+  --sheet: #ffffff;
+  --query: #c2c2c2;
+  --caret: #c2c2c2;
+  --line: #f0f0f0;
+  --result: #8a8a8a;
+  --result-active: #5c5c5c;
+  --result-bg: #f4f4f4;
+  --note: #c2c2c2;
+  --icon-bg: #f0f0f0;
+  --menu-bg: #ffffff;
+  --menu-text: #1f1f1f;
+  --menu-hover: #f2f2f2;
+  --error: #b42318;
+  --shadow:
+    0 2px 6px rgba(0, 0, 0, 0.05),
+    0 12px 32px rgba(0, 0, 0, 0.1);
 }
 
 body {
   font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-  color: #c2c2c2;
+  color: var(--query);
   user-select: none;
   -webkit-font-smoothing: antialiased;
 }
@@ -281,13 +439,11 @@ body {
 }
 
 .sheet {
-  background: #ffffff;
+  background: var(--sheet);
   border-radius: 16px;
   overflow: hidden;
   transform: translateZ(0);
-  box-shadow:
-    0 2px 6px rgba(0, 0, 0, 0.05),
-    0 12px 32px rgba(0, 0, 0, 0.1);
+  box-shadow: var(--shadow);
 }
 
 .query {
@@ -297,18 +453,18 @@ body {
   border: 0;
   outline: none;
   background: transparent;
-  color: #c2c2c2;
+  color: var(--query);
   font: inherit;
   font-size: 32px;
   font-weight: 400;
   line-height: 84px;
   padding: 0 32px;
-  caret-color: #c2c2c2;
+  caret-color: var(--caret);
   user-select: text;
 }
 
 .sheet:has(.drawer.open) .query {
-  border-bottom: 1px solid #f0f0f0;
+  border-bottom: 1px solid var(--line);
 }
 
 .drawer {
@@ -327,7 +483,7 @@ body {
 }
 
 .query::placeholder {
-  color: #c2c2c2;
+  color: var(--query);
 }
 
 .results {
@@ -344,7 +500,7 @@ body {
   text-align: left;
   border: 0;
   background: transparent;
-  color: #8a8a8a;
+  color: var(--result);
   font: inherit;
   font-size: 16px;
   border-radius: 12px;
@@ -353,8 +509,8 @@ body {
 }
 
 .results button.active {
-  color: #5c5c5c;
-  background: #f4f4f4;
+  color: var(--result-active);
+  background: var(--result-bg);
 }
 
 .name {
@@ -371,18 +527,18 @@ body {
 }
 
 .placeholder {
-  background: #f0f0f0;
+  background: var(--icon-bg);
 }
 
 .note {
   margin: 0;
   padding: 14px 32px 18px;
-  color: #c2c2c2;
+  color: var(--note);
   font-size: 16px;
 }
 
 .error {
-  color: #b42318;
+  color: var(--error);
 }
 
 .menu {
@@ -392,7 +548,7 @@ body {
   margin: 0;
   padding: 6px;
   border-radius: 8px;
-  background: #ffffff;
+  background: var(--menu-bg);
   box-shadow:
     0 1px 2px rgba(0, 0, 0, 0.08),
     0 8px 24px rgba(0, 0, 0, 0.14);
@@ -404,7 +560,7 @@ body {
   border: 0;
   border-radius: 4px;
   background: transparent;
-  color: #1f1f1f;
+  color: var(--menu-text);
   font: inherit;
   font-size: 14px;
   line-height: 1.2;
@@ -414,7 +570,23 @@ body {
 }
 
 .menu button:hover {
-  background: #f2f2f2;
+  background: var(--menu-hover);
+}
+
+.hint-input {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  border: 0;
+  border-radius: 4px;
+  background: var(--menu-hover);
+  color: var(--menu-text);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.2;
+  padding: 8px 12px;
+  outline: none;
+  user-select: text;
 }
 
 @media (prefers-reduced-motion: reduce) {
