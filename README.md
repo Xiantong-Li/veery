@@ -8,10 +8,6 @@
   <img src="https://img.shields.io/badge/version-0.2.3-lightgrey" alt="version 0.2.3" />
   <a href="https://github.com/Xiantong-Li/veery"><img src="https://img.shields.io/badge/GitHub-181717?logo=github&amp;logoColor=white" alt="GitHub" /></a>
   <a href="https://gitee.com/li-xiantong/veery"><img src="https://img.shields.io/badge/Gitee-C71D23?logo=gitee&amp;logoColor=white" alt="Gitee" /></a>
-  <br />
-  <a href="https://github.com/Xiantong-Li/veery/releases/latest">GitHub 下载安装版</a>
-  ·
-  <a href="https://gitee.com/li-xiantong/veery/releases/latest">码云下载安装版</a>
 </p>
 
 <h1 align="center">Veery</h1>
@@ -21,6 +17,15 @@
 <p align="center">让一切启动，都简单一点。</p>
 
 Veery（维里）是一个常驻系统托盘的 Windows 启动器。按下全局快捷键后，在屏幕上方弹出搜索框，输入程序的全称、拼音或首字母，回车或点击即可打开开始菜单里的程序。
+
+## 下载
+
+国内用户推荐从码云下载。国外用户从 GitHub 下载。
+
+| 地区 | 说明 | 下载 |
+| --- | --- | --- |
+| 国内 | 推荐从码云下载 | [码云最新版](https://gitee.com/li-xiantong/veery/releases/latest) |
+| 国外 | 从 GitHub 下载 | [GitHub 最新版](https://github.com/Xiantong-Li/veery/releases/latest) |
 
 ## 功能
 
