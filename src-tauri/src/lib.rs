@@ -354,6 +354,15 @@ fn ensure_shortcut(app: &AppHandle) {
     let _ = register_shortcut(app, &shortcut);
 }
 
+fn schedule_settings(app: &AppHandle) {
+    // 托盘菜单还在自己的消息循环里时创建 WebView，Windows 上会得到一个崩溃页。
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let app_for_window = app.clone();
+        let _ = app.run_on_main_thread(move || show_settings(&app_for_window));
+    });
+}
+
 fn show_settings(app: &AppHandle) {
     hide_launcher(app);
     if let Some(window) = app.get_webview_window("settings") {
@@ -408,7 +417,7 @@ fn install_tray(app: &tauri::App) -> tauri::Result<()> {
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => show_launcher(app),
-            "settings" => show_settings(app),
+            "settings" => schedule_settings(app),
             "quit" => app.exit(0),
             _ => {}
         })

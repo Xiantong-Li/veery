@@ -24,7 +24,7 @@
         "noRedirectionBitmap": true,
         "dragDropEnabled": false,
         "dataDirectory": "webview",
-        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,BackForwardCache,AudioServiceOutOfProcess,TranslateUI,CalculateNativeWinOcclusion --disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --disable-extensions --disable-default-apps --disable-breakpad --metrics-recording-only --no-first-run --renderer-process-limit=1 --disk-cache-size=1 --media-cache-size=1",
+        "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,BackForwardCache,AudioServiceOutOfProcess,TranslateUI,CalculateNativeWinOcclusion --disable-background-networking --disable-component-update --disable-domain-reliability --disable-sync --disable-extensions --disable-default-apps --disable-breakpad --metrics-recording-only --no-first-run --disk-cache-size=1 --media-cache-size=1",
         "center": true,
         "skipTaskbar": true,
         "alwaysOnTop": true,
