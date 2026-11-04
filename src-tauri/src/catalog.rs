@@ -8,8 +8,10 @@ use serde::Serialize;
 pub struct AppEntry {
     pub id: u32,
     pub name: String,
+    pub alias: String,
     pub folded: String,
     pub pinyin: String,
+    pub syllables: String,
     pub initials: String,
     pub path: PathBuf,
 }
@@ -51,14 +53,14 @@ pub fn scan() -> Result<Vec<AppEntry>, String> {
 }
 
 pub fn search(apps: &[AppEntry], query: &str, limit: usize) -> Vec<SearchHit> {
-    let query = fold(query);
-    if query.is_empty() || limit == 0 {
+    let tokens: Vec<String> = query.split_whitespace().map(fold).filter(|token| !token.is_empty()).collect();
+    if tokens.is_empty() || limit == 0 {
         return Vec::new();
     }
 
     let mut best: Vec<(i32, &AppEntry)> = Vec::with_capacity(limit);
     for app in apps {
-        let Some(value) = score(app, &query) else {
+        let Some(value) = score_query(app, &tokens) else {
             continue;
         };
         let ahead = best.iter().position(|(kept_score, kept)| {
@@ -206,24 +208,19 @@ fn collect(dir: &Path, into: &mut HashMap<String, AppEntry>, seen: &mut HashSet<
         if !is_link {
             continue;
         }
-        let Some(name) = path.file_stem().map(|stem| stem.to_string_lossy().trim().to_string()) else {
+        let Some(stem) = path.file_stem().map(|stem| stem.to_string_lossy().trim().to_string()) else {
             continue;
         };
-        if name.is_empty() || is_uninstaller(&name) {
+        if stem.is_empty() || is_uninstaller(&stem) {
             continue;
         }
-        let (folded, pinyin, initials) = index_fields(&name);
-        into.insert(
-            name.to_lowercase(),
-            AppEntry {
-                id: 0,
-                name,
-                folded,
-                pinyin,
-                initials,
-                path,
-            },
-        );
+        // 快捷方式文件名经常是英文，开始菜单里显示的是本地化名字。
+        let shown = display_name(&path).filter(|name| !name.is_empty()).unwrap_or_else(|| stem.clone());
+        if is_uninstaller(&shown) {
+            continue;
+        }
+        let app = indexed(&shown, &stem, path);
+        into.insert(shown.to_lowercase(), app);
     }
 }
 
@@ -232,7 +229,74 @@ fn is_uninstaller(name: &str) -> bool {
     lower.contains("uninstall") || name.contains("卸载")
 }
 
-fn index_fields(name: &str) -> (String, String, String) {
+fn indexed(shown: &str, stem: &str, path: PathBuf) -> AppEntry {
+    let (mut folded, mut pinyin, mut syllables, mut initials) = index_fields(shown);
+    let alias = if shown.eq_ignore_ascii_case(stem) {
+        String::new()
+    } else {
+        let (alias_folded, alias_pinyin, alias_syllables, alias_initials) = index_fields(stem);
+        folded = format!("{folded}\n{alias_folded}");
+        if !alias_pinyin.is_empty() {
+            pinyin = if pinyin.is_empty() {
+                alias_pinyin
+            } else {
+                format!("{pinyin}\n{alias_pinyin}")
+            };
+        }
+        if !alias_syllables.is_empty() {
+            syllables = if syllables.is_empty() {
+                alias_syllables
+            } else {
+                format!("{syllables}\n{alias_syllables}")
+            };
+        }
+        if !alias_initials.is_empty() {
+            initials = if initials.is_empty() {
+                alias_initials
+            } else {
+                format!("{initials}\n{alias_initials}")
+            };
+        }
+        stem.to_string()
+    };
+    AppEntry {
+        id: 0,
+        name: shown.to_string(),
+        alias,
+        folded,
+        pinyin,
+        syllables,
+        initials,
+        path,
+    }
+}
+
+fn display_name(path: &Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_DISPLAYNAME};
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let mut info = SHFILEINFOW::default();
+    let found = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_DISPLAYNAME,
+        )
+    };
+    if found == 0 {
+        return None;
+    }
+    let end = info.szDisplayName.iter().position(|unit| *unit == 0).unwrap_or(info.szDisplayName.len());
+    let name = String::from_utf16_lossy(&info.szDisplayName[..end]).trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+fn index_fields(name: &str) -> (String, String, String, String) {
     let folded = fold(name);
     let mut word_initials = String::new();
     for word in name.split(|ch: char| !ch.is_ascii_alphanumeric()) {
@@ -241,15 +305,20 @@ fn index_fields(name: &str) -> (String, String, String) {
         }
     }
     if name.is_ascii() {
-        return (folded, String::new(), word_initials);
+        return (folded, String::new(), String::new(), word_initials);
     }
 
     let mut pinyin_full = String::new();
+    let mut syllables = String::new();
     let mut pinyin_initials = String::new();
     for ch in name.chars() {
         if let Some(item) = ch.to_pinyin() {
             let plain = item.plain();
             pinyin_full.push_str(plain);
+            if !syllables.is_empty() {
+                syllables.push(' ');
+            }
+            syllables.push_str(plain);
             if let Some(initial) = plain.chars().next() {
                 pinyin_initials.push(initial);
             }
@@ -263,45 +332,243 @@ fn index_fields(name: &str) -> (String, String, String) {
     } else {
         format!("{pinyin_initials}{word_initials}")
     };
-    (folded, pinyin_full, initials)
+    (folded, pinyin_full, syllables, initials)
 }
 
 fn fold(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| !ch.is_whitespace())
-        .flat_map(|ch| ch.to_lowercase())
-        .collect()
+    let mut folded = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        let ch = match ch as u32 {
+            code @ 0xFF01..=0xFF5E => char::from_u32(code - 0xFEE0).unwrap_or(ch),
+            _ => ch,
+        };
+        for lower in ch.to_lowercase() {
+            folded.push(lower);
+        }
+    }
+    folded
+}
+
+fn score_query(app: &AppEntry, tokens: &[String]) -> Option<i32> {
+    let mut total: i32 = 0;
+    for token in tokens {
+        total = total.saturating_add(score(app, token)?);
+    }
+    Some(total)
 }
 
 fn score(app: &AppEntry, query: &str) -> Option<i32> {
-    if app.folded == query || app.pinyin == query {
-        return Some(1000);
+    let mut best = 0;
+    let mut matched = false;
+    let mut keep = |value: i32| {
+        matched = true;
+        if value > best {
+            best = value;
+        }
+    };
+    for part in app.folded.split('\n') {
+        if let Some(value) = score_text(part, query) {
+            keep(value);
+        }
     }
-    if app.folded.starts_with(query) || (!app.pinyin.is_empty() && app.pinyin.starts_with(query)) {
-        return Some(800);
+    for part in app.pinyin.split('\n') {
+        if let Some(value) = score_text(part, query) {
+            keep(value);
+        }
     }
-    if app.initials == query {
-        return Some(780);
+    if let Some(value) = score_words(&app.name, query) {
+        keep(value);
     }
-    if app.initials.starts_with(query) {
-        return Some(700);
+    if !app.alias.is_empty() {
+        if let Some(value) = score_words(&app.alias, query) {
+            keep(value);
+        }
     }
-    if app.folded.contains(query) || (!app.pinyin.is_empty() && app.pinyin.contains(query)) {
-        return Some(500);
+    for part in app.syllables.split('\n') {
+        if let Some(value) = score_syllables(part, query) {
+            keep(value);
+        }
     }
-    if is_subsequence(query, &app.folded)
-        || (!app.pinyin.is_empty() && is_subsequence(query, &app.pinyin))
-        || is_subsequence(query, &app.initials)
+    for part in app.initials.split('\n') {
+        if let Some(value) = score_initials(part, query) {
+            keep(value);
+        }
+    }
+    // 「资源文件管理器」和系统显示的「文件资源管理器」是同一组字，只是顺序不同。
+    if same_characters(query, primary_name(&app.folded)) {
+        keep(500);
+    }
+    if query.chars().count() >= 5 && query.is_ascii() {
+        if let Some(value) = score_typo(app, query) {
+            keep(value);
+        }
+    }
+    drop(keep);
+    if !matched && query.chars().count() >= 3 && (is_subsequence(query, &app.folded) || (!app.pinyin.is_empty() && is_subsequence(query, &app.pinyin)) || is_subsequence(query, &app.initials))
     {
-        return Some(200);
+        matched = true;
+        best = best.max(200);
     }
-    None
+    matched.then_some(best)
+}
+
+fn score_text(text: &str, query: &str) -> Option<i32> {
+    if text.is_empty() || query.is_empty() {
+        return None;
+    }
+    if text == query {
+        Some(1000)
+    } else if text.starts_with(query) {
+        Some(800)
+    } else if text.contains(query) {
+        Some(500)
+    } else {
+        None
+    }
+}
+
+fn score_words(name: &str, query: &str) -> Option<i32> {
+    let mut best = None;
+    for word in name.split(|ch: char| !ch.is_ascii_alphanumeric()) {
+        let word = fold(word);
+        if word.is_empty() {
+            continue;
+        }
+        let value = if word == query {
+            900
+        } else if word.starts_with(query) {
+            850
+        } else {
+            continue;
+        };
+        best = Some(best.map_or(value, |current: i32| current.max(value)));
+    }
+    best
+}
+
+fn score_syllables(syllables: &str, query: &str) -> Option<i32> {
+    let parts: Vec<&str> = syllables.split_whitespace().filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let mut best = None;
+    for start in 0..parts.len() {
+        let mut joined = String::new();
+        for (offset, syllable) in parts[start..].iter().enumerate() {
+            if joined.len() + syllable.len() > query.len() {
+                break;
+            }
+            joined.push_str(syllable);
+            if joined.len() != query.len() {
+                if !query.starts_with(&joined) {
+                    break;
+                }
+                continue;
+            }
+            if joined != query {
+                break;
+            }
+            let value = if start == 0 && offset + 1 == parts.len() {
+                1000
+            } else if start == 0 {
+                800
+            } else {
+                860
+            };
+            best = Some(best.map_or(value, |current: i32| current.max(value)));
+            break;
+        }
+    }
+    best
+}
+
+fn score_initials(initials: &str, query: &str) -> Option<i32> {
+    if initials.is_empty() {
+        return None;
+    }
+    if initials == query {
+        Some(780)
+    } else if initials.starts_with(query) {
+        Some(700)
+    } else if query.chars().count() >= 3 && initials.contains(query) {
+        Some(660)
+    } else {
+        None
+    }
+}
+
+fn score_typo(app: &AppEntry, query: &str) -> Option<i32> {
+    let close = app
+        .folded
+        .split('\n')
+        .chain(app.name.split(|ch: char| !ch.is_ascii_alphanumeric()))
+        .chain(app.alias.split(|ch: char| !ch.is_ascii_alphanumeric()))
+        .map(fold)
+        .filter(|text| text.chars().count() >= 5)
+        .any(|text| within_one_edit(&text, query));
+    close.then_some(420)
+}
+
+fn primary_name(folded: &str) -> &str {
+    folded.split('\n').next().unwrap_or(folded)
+}
+
+fn same_characters(query: &str, name: &str) -> bool {
+    let count = query.chars().count();
+    if count < 4 || query.chars().all(|ch| ch.is_ascii()) || count != name.chars().count() {
+        return false;
+    }
+    let mut left: Vec<char> = query.chars().collect();
+    let mut right: Vec<char> = name.chars().collect();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
 }
 
 fn is_subsequence(needle: &str, haystack: &str) -> bool {
     let mut rest = haystack.chars();
     needle.chars().all(|ch| rest.any(|candidate| candidate == ch))
+}
+
+fn within_one_edit(left: &str, right: &str) -> bool {
+    let left: Vec<char> = left.chars().collect();
+    let right: Vec<char> = right.chars().collect();
+    let (left_len, right_len) = (left.len(), right.len());
+    if left_len.abs_diff(right_len) > 1 || left == right {
+        return false;
+    }
+    if left_len == right_len {
+        let mut mismatches = Vec::new();
+        for index in 0..left_len {
+            if left[index] != right[index] {
+                mismatches.push(index);
+            }
+        }
+        return mismatches.len() == 1
+            || (mismatches.len() == 2
+                && mismatches[1] == mismatches[0] + 1
+                && left[mismatches[0]] == right[mismatches[1]]
+                && left[mismatches[1]] == right[mismatches[0]]);
+    }
+    let (longer, shorter) = if left_len > right_len { (&left, &right) } else { (&right, &left) };
+    let mut long_index = 0;
+    let mut short_index = 0;
+    let mut skipped = false;
+    while long_index < longer.len() && short_index < shorter.len() {
+        if longer[long_index] == shorter[short_index] {
+            long_index += 1;
+            short_index += 1;
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            long_index += 1;
+        }
+    }
+    true
 }
 
 fn hit(app: &AppEntry) -> SearchHit {
@@ -439,15 +706,39 @@ mod tests {
     use super::*;
 
     fn entry(name: &str) -> AppEntry {
-        let (folded, pinyin, initials) = index_fields(name);
+        let (folded, pinyin, syllables, initials) = index_fields(name);
         AppEntry {
             id: 0,
             name: name.to_string(),
+            alias: String::new(),
             folded,
             pinyin,
+            syllables,
             initials,
             path: PathBuf::new(),
         }
+    }
+
+    #[test]
+    fn explorer_matches_the_name_windows_shows() {
+        let app = indexed("文件资源管理器", "File Explorer", PathBuf::new());
+        assert_eq!(app.name, "文件资源管理器");
+        assert!(score(&app, "文件资源管理器").unwrap() >= 1000);
+        assert!(score(&app, "资源管理器").unwrap() >= 500);
+        assert!(score(&app, "资源文件管理器").unwrap() >= 500);
+        assert!(score(&app, "explorer").unwrap() >= 900);
+        assert!(score(&app, "zyglq").unwrap() >= 660);
+        assert!(score(&app, "ziyuan").unwrap() >= 860);
+        assert!(score(&app, "explroer").unwrap() >= 420);
+    }
+
+    #[test]
+    fn several_words_must_all_match() {
+        let hits = search(&apps(&["Visual Studio Code", "Visual Studio", "Code"]), "visual code", 8);
+        assert_eq!(hits[0].name, "Visual Studio Code");
+        assert!(hits.iter().all(|hit| hit.name != "Visual Studio"));
+        let hits = search(&apps(&["Visual Studio Code"]), "vs code", 8);
+        assert_eq!(hits[0].name, "Visual Studio Code");
     }
 
     #[test]
