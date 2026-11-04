@@ -40,6 +40,8 @@ pub fn scan() -> Result<Vec<AppEntry>, String> {
         saw_dir = true;
         collect(&dir, &mut by_name, &mut seen, 0);
     }
+    // 计算器、终端这类应用没有快捷方式，只登记在系统的应用列表里。
+    collect_shell_apps(&mut by_name);
     if !saw_dir {
         return Err("开始菜单目录不存在".to_string());
     }
@@ -96,6 +98,9 @@ pub fn open_elevated(path: &Path) -> Result<(), String> {
 }
 
 pub fn reveal(path: &Path) -> Result<(), String> {
+    if is_shell_app(path) {
+        return Err("这个程序没有文件位置".to_string());
+    }
     let target = link_target(path).filter(|target| !target.as_os_str().is_empty());
     let target = target
         .filter(|target| target.exists())
@@ -227,6 +232,86 @@ fn collect(dir: &Path, into: &mut HashMap<String, AppEntry>, seen: &mut HashSet<
 fn is_uninstaller(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.contains("uninstall") || name.contains("卸载")
+}
+
+fn unresolved_name(name: &str) -> bool {
+    name.starts_with("@{") || name.starts_with("ms-resource:")
+}
+
+fn is_shell_app(path: &Path) -> bool {
+    path.to_string_lossy().starts_with("shell:")
+}
+
+fn app_path(parsing: &str) -> Option<PathBuf> {
+    let parsing = parsing.trim();
+    if parsing.is_empty() {
+        return None;
+    }
+    if parsing.contains('\\') || parsing.contains('/') {
+        Some(PathBuf::from(parsing))
+    } else {
+        Some(PathBuf::from(format!(r"shell:AppsFolder\{parsing}")))
+    }
+}
+
+fn shell_string(value: windows::core::Result<windows::core::PWSTR>) -> Option<String> {
+    let ptr = value.ok()?;
+    let text = if ptr.is_null() {
+        String::new()
+    } else {
+        let text = unsafe { String::from_utf16_lossy(ptr.as_wide()) };
+        unsafe {
+            windows::Win32::System::Com::CoTaskMemFree(Some(ptr.as_ptr() as *const core::ffi::c_void));
+        }
+        text
+    };
+    let text = text.trim();
+    if text.is_empty() { None } else { Some(text.to_string()) }
+}
+
+fn collect_shell_apps(into: &mut HashMap<String, AppEntry>) {
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, IBindCtx};
+    use windows::Win32::UI::Shell::{
+        IEnumShellItems, IShellItem, SHGetKnownFolderItem, BHID_EnumItems, FOLDERID_AppsFolder, KF_FLAG_DEFAULT,
+        SIGDN_NORMALDISPLAY, SIGDN_PARENTRELATIVEPARSING,
+    };
+
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let Ok(folder) = SHGetKnownFolderItem::<IShellItem>(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, None) else {
+            return;
+        };
+        let Ok(items) = folder.BindToHandler::<_, IEnumShellItems>(None::<&IBindCtx>, &BHID_EnumItems) else {
+            return;
+        };
+        for _ in 0..4096 {
+            let mut fetched = 0u32;
+            let mut batch = [None];
+            if items.Next(&mut batch, Some(&mut fetched)).is_err() || fetched == 0 {
+                break;
+            }
+            let Some(item) = batch[0].take() else {
+                break;
+            };
+            let Some(name) = shell_string(item.GetDisplayName(SIGDN_NORMALDISPLAY)) else {
+                continue;
+            };
+            if is_uninstaller(&name) || unresolved_name(&name) {
+                continue;
+            }
+            let key = name.to_lowercase();
+            if into.contains_key(&key) {
+                continue;
+            }
+            let Some(parsing) = shell_string(item.GetDisplayName(SIGDN_PARENTRELATIVEPARSING)) else {
+                continue;
+            };
+            let Some(path) = app_path(&parsing) else {
+                continue;
+            };
+            into.insert(key, indexed(&name, &name, path));
+        }
+    }
 }
 
 fn indexed(shown: &str, stem: &str, path: PathBuf) -> AppEntry {
@@ -587,6 +672,9 @@ pub fn icon_data_url(path: &Path) -> Option<String> {
 }
 
 fn file_icon_png(path: &Path) -> Option<Vec<u8>> {
+    if is_shell_app(path) {
+        return shell_icon_png(path);
+    }
     // SHGetFileInfoW 给出的 HICON 由调用方负责销毁，编码失败时也不能漏掉。
     use std::os::windows::ffi::OsStrExt;
     use windows::core::PCWSTR;
@@ -613,6 +701,111 @@ fn file_icon_png(path: &Path) -> Option<Vec<u8>> {
         let _ = DestroyIcon(info.hIcon);
     }
     png
+}
+
+fn shell_icon_png(path: &Path) -> Option<Vec<u8>> {
+    use windows::core::{Interface, PCWSTR};
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Graphics::Gdi::DeleteObject;
+    use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED, IBindCtx};
+    use windows::Win32::UI::Shell::{
+        IShellItem, IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    };
+
+    let wide = wide_path(path);
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let item = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None::<&IBindCtx>).ok()?;
+        let factory: IShellItemImageFactory = item.cast().ok()?;
+        let bitmap = factory
+            .GetImage(SIZE { cx: 32, cy: 32 }, SIIGBF(SIIGBF_BIGGERSIZEOK.0 | SIIGBF_ICONONLY.0))
+            .ok()?;
+        if bitmap.is_invalid() {
+            return None;
+        }
+        let png = hbitmap_to_png(bitmap);
+        let _ = DeleteObject(bitmap.into());
+        png
+    }
+}
+
+unsafe fn hbitmap_to_png(bitmap: windows::Win32::Graphics::Gdi::HBITMAP) -> Option<Vec<u8>> {
+    use windows::Win32::Graphics::Gdi::{
+        GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HGDIOBJ,
+    };
+
+    let mut bitmap_info = BITMAP::default();
+    let wrote = unsafe {
+        GetObjectW(
+            HGDIOBJ(bitmap.0),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bitmap_info as *mut BITMAP as *mut core::ffi::c_void),
+        )
+    };
+    if wrote == 0 || bitmap_info.bmWidth <= 0 || bitmap_info.bmHeight <= 0 {
+        return None;
+    }
+    let width = bitmap_info.bmWidth as u32;
+    let height = bitmap_info.bmHeight as u32;
+    if width > 256 || height > 256 {
+        return None;
+    }
+    let screen = unsafe { GetDC(None) };
+    if screen.is_invalid() {
+        return None;
+    }
+    let mut info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: bitmap_info.bmWidth,
+            biHeight: -(bitmap_info.bmHeight),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut pixels = vec![0u8; (width * height * 4) as usize];
+    let lines = unsafe {
+        GetDIBits(
+            screen,
+            bitmap,
+            0,
+            height,
+            Some(pixels.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut info,
+            DIB_RGB_COLORS,
+        )
+    };
+    unsafe {
+        ReleaseDC(None, screen);
+    }
+    if lines <= 0 {
+        return None;
+    }
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+        let alpha = pixel[3];
+        if alpha == 0 {
+            if pixel[0] | pixel[1] | pixel[2] != 0 {
+                pixel[3] = 255;
+            }
+        } else if alpha < 255 {
+            for channel in &mut pixel[..3] {
+                *channel = ((*channel as u16 * 255) / alpha as u16).min(255) as u8;
+            }
+        }
+    }
+    let mut output = Vec::new();
+    let mut encoder = png::Encoder::new(&mut output, width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::Fast);
+    let mut writer = encoder.write_header().ok()?;
+    writer.write_image_data(&pixels).ok()?;
+    drop(writer);
+    Some(output)
 }
 
 unsafe fn hicon_to_png(icon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<Vec<u8>> {
@@ -759,7 +952,7 @@ mod tests {
 
     #[test]
     fn start_menu_shortcut_has_png_icon() {
-        let Some(app) = scan().ok().and_then(|apps| apps.into_iter().next()) else {
+        let Some(app) = scan().ok().and_then(|apps| apps.into_iter().find(|app| is_shortcut(&app.path))) else {
             return;
         };
         let icon = icon_data_url(&app.path).unwrap_or_else(|| panic!("没有图标: {}", app.name));
@@ -768,11 +961,51 @@ mod tests {
 
     #[test]
     fn shortcut_resolves_to_a_target() {
-        let Some(app) = scan().ok().and_then(|apps| apps.into_iter().next()) else {
+        let Some(app) = scan().ok().and_then(|apps| apps.into_iter().find(|app| is_shortcut(&app.path))) else {
             return;
         };
         let target = link_target(&app.path).unwrap_or_else(|| panic!("没有目标: {}", app.name));
         assert!(!target.as_os_str().is_empty());
+    }
+
+    fn is_shortcut(path: &Path) -> bool {
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
+    }
+
+    #[test]
+    fn app_path_keeps_files_and_wraps_app_ids() {
+        assert_eq!(
+            app_path(r"Microsoft.WindowsCalculator_8wekyb3d8bbwe!App").unwrap(),
+            PathBuf::from(r"shell:AppsFolder\Microsoft.WindowsCalculator_8wekyb3d8bbwe!App")
+        );
+        assert_eq!(app_path(r"C:\Apps\Tool.exe").unwrap(), PathBuf::from(r"C:\Apps\Tool.exe"));
+        assert!(app_path("  ").is_none());
+    }
+
+    #[test]
+    fn calculator_and_terminal_are_searchable() {
+        let Ok(apps) = scan() else {
+            return;
+        };
+        for name in ["计算器", "终端"] {
+            let Some(app) = apps.iter().find(|app| app.name == name) else {
+                panic!("应用列表里没有{name}");
+            };
+            let path = app.path.to_string_lossy().to_ascii_lowercase();
+            assert!(
+                path.starts_with(r"shell:appsfolder\") || path.ends_with(".lnk"),
+                "{name} -> {}",
+                app.path.display()
+            );
+            assert_eq!(search(&apps, name, 8).first().map(|hit| hit.name.as_str()), Some(name));
+            let icon = icon_data_url(&app.path);
+            assert!(
+                icon.as_ref().is_some_and(|icon| icon.starts_with("data:image/png;base64,")),
+                "{name} 没有图标"
+            );
+        }
     }
 
     fn apps(names: &[&str]) -> Vec<AppEntry> {
