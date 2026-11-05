@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WebviewUrl, WebviewWindowBuilder, WindowEvent, Wry};
+use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, WindowEvent, Wry};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, SC_KEYMENU, WM_SYSCOMMAND};
@@ -33,6 +33,7 @@ struct AppState {
     index_ready: AtomicBool,
     icons: Mutex<IconCache>,
     shown_at: Mutex<Instant>,
+    settings_open: AtomicBool,
     shortcut: Mutex<String>,
     tray: Mutex<Option<TrayItems>>,
 }
@@ -99,7 +100,7 @@ unsafe extern "system" fn subclass_child(hwnd: HWND, _lparam: LPARAM) -> windows
 }
 
 fn guard_alt_space(window: &tauri::WebviewWindow) {
-    // 只拦设置窗口自己的 Alt+空格系统菜单，不改其他程序的快捷键。
+    // 录入快捷键时拦住主窗口的 Alt+空格系统菜单，不改其他程序的快捷键。
     if let Ok(hwnd) = window.hwnd() {
         unsafe {
             let _ = SetWindowSubclass(hwnd, Some(suppress_system_menu), 1, 0);
@@ -212,6 +213,9 @@ fn hide_launcher(app: &AppHandle) {
     };
     if !window.is_visible().unwrap_or(false) {
         return;
+    }
+    if let Some(state) = app.try_state::<AppState>() {
+        state.settings_open.store(false, Ordering::Release);
     }
     let _ = window.hide();
     let _ = window.emit("hidden", ());
@@ -354,14 +358,6 @@ fn apply_tray(app: &AppHandle) {
     }
 }
 
-fn settings_title(app: &AppHandle) -> &'static str {
-    if settings::load(app).language == "en" {
-        "Settings"
-    } else {
-        "设置"
-    }
-}
-
 fn saved_shortcut(app: &AppHandle) -> String {
     app.try_state::<AppState>()
         .and_then(|state| state.shortcut.lock().ok().map(|shortcut| shortcut.clone()))
@@ -380,35 +376,8 @@ fn ensure_shortcut(app: &AppHandle) {
 }
 
 fn show_settings(app: &AppHandle) {
-    hide_launcher(app);
-    if let Some(window) = app.get_webview_window("settings") {
-        let _ = window.unminimize();
-        let _ = window.show();
-        let _ = window.set_focus();
-        return;
-    }
-    let data_dir = app
-        .path()
-        .app_local_data_dir()
-        .map(|dir| dir.join("settings"))
-        .unwrap_or_else(|_| PathBuf::from("settings"));
-    if let Err(error) = WebviewWindowBuilder::new(app, "settings", WebviewUrl::App("index.html".into()))
-        .title(settings_title(app))
-        .inner_size(760.0, 520.0)
-        .center()
-        .focused(true)
-        .resizable(true)
-        .visible(true)
-        .data_directory(data_dir)
-        .icon(tauri::include_image!("icons/128x128.png"))
-        .and_then(|builder| builder.build())
-    {
-        eprintln!("veery: 设置窗口创建失败: {error}");
-        return;
-    }
-    if let Some(window) = app.get_webview_window("settings") {
-        guard_alt_space(&window);
-    }
+    show_launcher(app);
+    let _ = app.emit("open-settings", ());
 }
 
 fn install_tray(app: &tauri::App) -> tauri::Result<()> {
@@ -599,17 +568,25 @@ fn hide_window(window: tauri::WebviewWindow) {
 }
 
 #[tauri::command]
-fn set_launcher_open(window: tauri::WebviewWindow, open: bool) {
+fn open_settings(app: AppHandle) {
+    show_settings(&app);
+}
+
+#[tauri::command]
+fn set_launcher_frame(window: tauri::WebviewWindow, mode: String) {
     if window.label() != "main" {
         return;
     }
-    let height = if open {
-        launcher_open_height(&window)
-    } else {
-        LAUNCHER_IDLE_HEIGHT
+    let settings = mode == "settings";
+    if let Some(state) = window.app_handle().try_state::<AppState>() {
+        state.settings_open.store(settings, Ordering::Release);
+    }
+    let height = match mode.as_str() {
+        "open" | "settings" => launcher_open_height(&window),
+        _ => LAUNCHER_IDLE_HEIGHT,
     };
     set_launcher_size(&window, height);
-    if open {
+    if mode != "idle" {
         keep_launcher_on_screen(&window, height);
     }
 }
@@ -618,7 +595,11 @@ fn set_launcher_open(window: tauri::WebviewWindow, open: bool) {
 fn get_settings(app: AppHandle) -> settings::SettingsInfo {
     let mut prefs = settings::load(&app);
     prefs.shortcut = saved_shortcut(&app);
-    settings::info(settings::autostart_enabled(), &prefs)
+    settings::info(
+        settings::autostart_enabled(),
+        settings::fast_autostart_enabled(),
+        &prefs,
+    )
 }
 
 #[tauri::command]
@@ -626,9 +607,6 @@ fn set_language(app: AppHandle, language: String) -> Result<(), String> {
     let theme = settings::load(&app).theme;
     let prefs = settings::save_appearance(&app, &language, &theme)?;
     apply_tray(&app);
-    if let Some(window) = app.get_webview_window("settings") {
-        let _ = window.set_title(settings_title(&app));
-    }
     let _ = app.emit(
         "appearance",
         serde_json::json!({ "language": prefs.language, "theme": prefs.theme }),
@@ -666,8 +644,22 @@ fn open_link(url: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn set_autostart(enabled: bool) -> Result<(), String> {
-    settings::set_autostart(enabled)
+fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    // 关掉开机启动时保留「优先加速」偏好，下次打开仍按原样。
+    let fast = settings::load(&app).fast_autostart;
+    settings::set_autostart(enabled, enabled && fast)
+}
+
+#[tauri::command]
+fn set_fast_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    if enabled && !settings::autostart_enabled() {
+        return Err("请先打开开机启动".to_string());
+    }
+    settings::save_fast_autostart(&app, enabled)?;
+    if !settings::autostart_enabled() {
+        return Ok(());
+    }
+    settings::set_autostart(true, enabled)
 }
 
 #[tauri::command]
@@ -729,6 +721,7 @@ pub fn run() {
                     pending: HashSet::new(),
                 }),
                 shown_at: Mutex::new(Instant::now() - Duration::from_secs(60)),
+                settings_open: AtomicBool::new(false),
                 shortcut: Mutex::new(shortcut.clone()),
                 tray: Mutex::new(None),
             });
@@ -754,16 +747,11 @@ pub fn run() {
             }
             if let Some(window) = app.get_webview_window("main") {
                 tune_webview(&window);
+                guard_alt_space(&window);
             }
             Ok(())
         })
         .on_window_event(|window, event| {
-            if window.label() == "settings" {
-                if matches!(event, WindowEvent::Destroyed) {
-                    ensure_shortcut(window.app_handle());
-                }
-                return;
-            }
             if window.label() != "main" {
                 return;
             }
@@ -773,9 +761,10 @@ pub fn run() {
                 hide_launcher(window.app_handle());
             }
             WindowEvent::Focused(false) => {
-                let recent = window
-                    .app_handle()
-                    .try_state::<AppState>()
+                let app = window.app_handle();
+                let state = app.try_state::<AppState>();
+                let recent = state
+                    .as_ref()
                     .and_then(|state| {
                         state
                             .shown_at
@@ -784,8 +773,13 @@ pub fn run() {
                             .map(|shown_at| shown_at.elapsed() < Duration::from_millis(300))
                     })
                     .unwrap_or(false);
-                if !recent {
-                    hide_launcher(window.app_handle());
+                let settings_open = state
+                    .as_ref()
+                    .map(|state| state.settings_open.load(Ordering::Acquire))
+                    .unwrap_or(false);
+                // 设置展开时点到外部链接会失焦，不能因此把面板关掉。
+                if !recent && !settings_open {
+                    hide_launcher(app);
                 }
             }
             _ => {}
@@ -798,9 +792,11 @@ pub fn run() {
             launch_admin,
             reveal,
             hide_window,
-            set_launcher_open,
+            open_settings,
+            set_launcher_frame,
             get_settings,
             set_autostart,
+            set_fast_autostart,
             set_language,
             set_search_hint,
             set_theme,

@@ -5,6 +5,7 @@ export type ThemeChoice = "system" | "light" | "dark";
 
 export type SettingsInfo = {
   autostart: boolean;
+  fastAutostart: boolean;
   shortcut: string;
   shortcutLabel: string;
   language: string;
@@ -59,6 +60,8 @@ const zh = {
   about: "关于",
   autostart: "开机启动",
   autostartDesc: "登录 Windows 后自动打开 Veery，并留在托盘里。",
+  fastAutostart: "优先加速启动",
+  fastAutostartDesc: "登录后立刻启动，不等系统排完其他开机项。需要先打开开机启动。",
   shortcut: "全局快捷键",
   shortcutDesc: "用来呼出或隐藏搜索框。点击右侧后按下新的组合键，Esc 取消。",
   pressShortcut: "请按快捷键",
@@ -85,8 +88,9 @@ const zh = {
   download: "前往下载",
   linkFailed: "暂时打不开这个链接",
   search: "搜索",
-  customizeHint: "自定义备注",
-  resetHint: "恢复默认备注",
+  settings: "设置",
+  hint: "搜索备注",
+  hintDesc: "搜索框里的提示文字。留空则使用默认的「搜索」。",
   indexing: "正在读取开始菜单",
   empty: "没有匹配的程序",
   open: "打开",
@@ -99,6 +103,8 @@ const en = {
   about: "About",
   autostart: "Start with Windows",
   autostartDesc: "Open Veery when you sign in to Windows, and keep it in the tray.",
+  fastAutostart: "Faster startup",
+  fastAutostartDesc: "Start right after sign-in, without waiting for other startup apps. Requires Start with Windows.",
   shortcut: "Global shortcut",
   shortcutDesc: "Shows or hides the search box. Click the button, then press a new shortcut. Esc cancels.",
   pressShortcut: "Press a shortcut",
@@ -125,8 +131,9 @@ const en = {
   download: "Download",
   linkFailed: "Couldn't open that link",
   search: "Search",
-  customizeHint: "Customize hint",
-  resetHint: "Reset hint",
+  settings: "Settings",
+  hint: "Search hint",
+  hintDesc: "Placeholder text in the search box. Leave empty to use the default “Search”.",
   indexing: "Reading the Start menu",
   empty: "No matching programs",
   open: "Open",
