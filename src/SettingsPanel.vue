@@ -1,9 +1,3 @@
-<script lang="ts">
-import type { SettingsInfo } from "./prefs";
-
-let cachedInfo: SettingsInfo | null = null;
-</script>
-
 <script setup lang="ts">
 import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
@@ -16,6 +10,7 @@ import {
   githubRepo,
   languageOf,
   prefsKey,
+  settingsPanelCache,
   themeOf,
   type Language,
   type SettingsInfo,
@@ -42,7 +37,7 @@ const generalEl = ref<HTMLButtonElement | null>(null);
 const aboutEl = ref<HTMLButtonElement | null>(null);
 const selectionReady = ref(false);
 const selection = ref({ y: 0, height: 0 });
-const info = ref<SettingsInfo | null>(cachedInfo ?? inject(prefsKey, null));
+const info = ref<SettingsInfo | null>(settingsPanelCache ?? inject(prefsKey, null));
 const switchReady = ref(false);
 const recording = ref(false);
 const message = ref("");
@@ -93,7 +88,7 @@ function moveSelection() {
 
 async function load() {
   const next = await invoke<SettingsInfo>("get_settings");
-  cachedInfo = next;
+  settingsPanelCache = next;
   info.value = next;
   hintDraft.value = next.hint;
   emit("hintChange", next.hint);
@@ -116,7 +111,7 @@ function toggleAutostart() {
   const mine = ++autostartTicket;
   info.value.autostart = enabled;
   if (!enabled) info.value.fastAutostart = false;
-  cachedInfo = info.value;
+  settingsPanelCache = info.value;
   message.value = "";
   autostartWrite = autostartWrite.then(async () => {
     try {
@@ -124,13 +119,13 @@ function toggleAutostart() {
       if (mine !== autostartTicket || !info.value) return;
       info.value.autostart = enabled;
       if (!enabled) info.value.fastAutostart = false;
-      cachedInfo = info.value;
+      settingsPanelCache = info.value;
       if (enabled) await load();
     } catch (cause) {
       if (mine === autostartTicket && info.value) {
         info.value.autostart = !enabled;
         info.value.fastAutostart = previousFast;
-        cachedInfo = info.value;
+        settingsPanelCache = info.value;
         message.value = String(cause);
       }
     }
@@ -142,19 +137,19 @@ function toggleFastAutostart() {
   const enabled = !info.value.fastAutostart;
   const mine = ++fastAutostartTicket;
   info.value.fastAutostart = enabled;
-  cachedInfo = info.value;
+  settingsPanelCache = info.value;
   message.value = "";
   autostartWrite = autostartWrite.then(async () => {
     try {
       await invoke("set_fast_autostart", { enabled });
       if (mine === fastAutostartTicket && info.value) {
         info.value.fastAutostart = enabled;
-        cachedInfo = info.value;
+        settingsPanelCache = info.value;
       }
     } catch (cause) {
       if (mine === fastAutostartTicket && info.value) {
         info.value.fastAutostart = !enabled;
-        cachedInfo = info.value;
+        settingsPanelCache = info.value;
         message.value = String(cause);
       }
     }
