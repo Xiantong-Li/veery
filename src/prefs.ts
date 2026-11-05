@@ -27,7 +27,7 @@ export type UpdateInfo = {
 export const prefsKey: InjectionKey<SettingsInfo | null> = Symbol("prefs");
 
 /** 设置面板卸载后仍保留上次状态，避免开关重挂时闪一下。 */
-export let settingsPanelCache: SettingsInfo | null = null;
+export const settingsPanelCache: { value: SettingsInfo | null } = { value: null };
 
 export const githubRepo = "https://github.com/Xiantong-Li/veery";
 export const giteeRepo = "https://gitee.com/li-xiantong/veery";

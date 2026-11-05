@@ -37,7 +37,7 @@ const generalEl = ref<HTMLButtonElement | null>(null);
 const aboutEl = ref<HTMLButtonElement | null>(null);
 const selectionReady = ref(false);
 const selection = ref({ y: 0, height: 0 });
-const info = ref<SettingsInfo | null>(settingsPanelCache ?? inject(prefsKey, null));
+const info = ref<SettingsInfo | null>(settingsPanelCache.value ?? inject(prefsKey, null));
 const switchReady = ref(false);
 const recording = ref(false);
 const message = ref("");
@@ -88,7 +88,7 @@ function moveSelection() {
 
 async function load() {
   const next = await invoke<SettingsInfo>("get_settings");
-  settingsPanelCache = next;
+  settingsPanelCache.value = next;
   info.value = next;
   hintDraft.value = next.hint;
   emit("hintChange", next.hint);
@@ -111,7 +111,7 @@ function toggleAutostart() {
   const mine = ++autostartTicket;
   info.value.autostart = enabled;
   if (!enabled) info.value.fastAutostart = false;
-  settingsPanelCache = info.value;
+  settingsPanelCache.value = info.value;
   message.value = "";
   autostartWrite = autostartWrite.then(async () => {
     try {
@@ -119,13 +119,13 @@ function toggleAutostart() {
       if (mine !== autostartTicket || !info.value) return;
       info.value.autostart = enabled;
       if (!enabled) info.value.fastAutostart = false;
-      settingsPanelCache = info.value;
+      settingsPanelCache.value = info.value;
       if (enabled) await load();
     } catch (cause) {
       if (mine === autostartTicket && info.value) {
         info.value.autostart = !enabled;
         info.value.fastAutostart = previousFast;
-        settingsPanelCache = info.value;
+        settingsPanelCache.value = info.value;
         message.value = String(cause);
       }
     }
@@ -137,19 +137,19 @@ function toggleFastAutostart() {
   const enabled = !info.value.fastAutostart;
   const mine = ++fastAutostartTicket;
   info.value.fastAutostart = enabled;
-  settingsPanelCache = info.value;
+  settingsPanelCache.value = info.value;
   message.value = "";
   autostartWrite = autostartWrite.then(async () => {
     try {
       await invoke("set_fast_autostart", { enabled });
       if (mine === fastAutostartTicket && info.value) {
         info.value.fastAutostart = enabled;
-        settingsPanelCache = info.value;
+        settingsPanelCache.value = info.value;
       }
     } catch (cause) {
       if (mine === fastAutostartTicket && info.value) {
         info.value.fastAutostart = !enabled;
-        settingsPanelCache = info.value;
+        settingsPanelCache.value = info.value;
         message.value = String(cause);
       }
     }
