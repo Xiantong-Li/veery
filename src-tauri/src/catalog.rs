@@ -517,19 +517,22 @@ fn score_text(text: &str, query: &str) -> Option<i32> {
 
 fn score_words(name: &str, query: &str) -> Option<i32> {
     let mut best = None;
+    let mut first = true;
     for word in name.split(|ch: char| !ch.is_ascii_alphanumeric()) {
         let word = fold(word);
         if word.is_empty() {
             continue;
         }
         let value = if word == query {
-            900
+            if first { 900 } else { 760 }
         } else if word.starts_with(query) {
-            850
+            if first { 850 } else { 720 }
         } else {
+            first = false;
             continue;
         };
         best = Some(best.map_or(value, |current: i32| current.max(value)));
+        first = false;
     }
     best
 }
@@ -919,7 +922,7 @@ mod tests {
         assert!(score(&app, "文件资源管理器").unwrap() >= 1000);
         assert!(score(&app, "资源管理器").unwrap() >= 500);
         assert!(score(&app, "资源文件管理器").unwrap() >= 500);
-        assert!(score(&app, "explorer").unwrap() >= 900);
+        assert!(score(&app, "explorer").unwrap() >= 760);
         assert!(score(&app, "zyglq").unwrap() >= 660);
         assert!(score(&app, "ziyuan").unwrap() >= 860);
         assert!(score(&app, "explroer").unwrap() >= 420);
@@ -1076,6 +1079,13 @@ mod tests {
         let hits = search(&apps(&["Visual Studio Code", "Code"]), "code", 8);
         assert_eq!(hits[0].name, "Code");
         assert_eq!(hits[1].name, "Visual Studio Code");
+    }
+
+    #[test]
+    fn leading_word_ranks_ahead_of_later_word_prefix() {
+        let hits = search(&apps(&["BPS Work Client", "Clash Verge"]), "cl", 8);
+        assert_eq!(hits[0].name, "Clash Verge");
+        assert_eq!(hits[1].name, "BPS Work Client");
     }
 
     #[test]
