@@ -10,6 +10,7 @@ use winreg::RegKey;
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_KEY_CMD: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_NAME: &str = "Veery";
+const TASK_NAME: &str = "VeeryStartup";
 pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
 
 pub const GITHUB_REPO: &str = "https://github.com/Xiantong-Li/veery";
@@ -19,6 +20,7 @@ pub const GITEE_REPO: &str = "https://gitee.com/li-xiantong/veery";
 #[serde(rename_all = "camelCase")]
 pub struct SettingsInfo {
     pub autostart: bool,
+    pub fast_autostart: bool,
     pub shortcut: String,
     pub shortcut_label: String,
     pub language: String,
@@ -36,6 +38,7 @@ pub struct Preferences {
     pub language: String,
     pub theme: String,
     pub hint: String,
+    pub fast_autostart: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -47,6 +50,8 @@ struct Saved {
     theme: String,
     #[serde(default)]
     hint: String,
+    #[serde(default)]
+    fast_autostart: bool,
 }
 
 fn default_language() -> String {
@@ -84,9 +89,10 @@ pub fn normalize_hint(value: &str) -> String {
         .collect()
 }
 
-pub fn info(autostart: bool, prefs: &Preferences) -> SettingsInfo {
+pub fn info(autostart: bool, fast_autostart: bool, prefs: &Preferences) -> SettingsInfo {
     SettingsInfo {
         autostart,
+        fast_autostart,
         shortcut_label: shortcut_label(&prefs.shortcut, prefs.language == "en"),
         shortcut: prefs.shortcut.clone(),
         language: prefs.language.clone(),
@@ -193,6 +199,7 @@ pub fn load(app: &AppHandle) -> Preferences {
             language: default_language(),
             theme: default_theme(),
             hint: String::new(),
+            fast_autostart: false,
         };
     };
     Preferences {
@@ -204,6 +211,7 @@ pub fn load(app: &AppHandle) -> Preferences {
         language: normalize_language(&saved.language),
         theme: normalize_theme(&saved.theme),
         hint: normalize_hint(&saved.hint),
+        fast_autostart: saved.fast_autostart,
     }
 }
 
@@ -245,6 +253,7 @@ fn store(app: &AppHandle, prefs: &Preferences) -> Result<(), String> {
         language: prefs.language.clone(),
         theme: prefs.theme.clone(),
         hint: prefs.hint.clone(),
+        fast_autostart: prefs.fast_autostart,
     })
     .map_err(|error| error.to_string())?;
     let temp = path.with_extension("json.tmp");
@@ -284,40 +293,104 @@ pub fn open_link(url: &str) -> Result<(), String> {
 }
 
 pub fn autostart_enabled() -> bool {
+    run_enabled() || task_enabled()
+}
+
+pub fn fast_autostart_enabled() -> bool {
+    task_enabled()
+}
+
+pub fn save_fast_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let mut prefs = load(app);
+    prefs.fast_autostart = enabled;
+    store(app, &prefs)
+}
+
+pub fn set_autostart(enabled: bool, fast: bool) -> Result<(), String> {
+    if !enabled {
+        let _ = remove_run();
+        let _ = remove_task();
+        if autostart_enabled() {
+            return Err("开机启动没有写入成功，系统拒绝了这项修改".to_string());
+        }
+        return Ok(());
+    }
+    if fast {
+        ensure_task()?;
+        let _ = remove_run();
+        if !task_enabled() {
+            return Err("优先加速启动没有写入成功，系统拒绝了这项修改".to_string());
+        }
+    } else {
+        ensure_run()?;
+        let _ = remove_task();
+        if !run_enabled() {
+            return Err("开机启动没有写入成功，系统拒绝了这项修改".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn run_enabled() -> bool {
     run_key()
         .ok()
         .and_then(|key| key.get_value::<String, _>(RUN_NAME).ok())
         .is_some()
 }
 
-pub fn set_autostart(enabled: bool) -> Result<(), String> {
-    if autostart_enabled() == enabled {
-        return Ok(());
-    }
-    if enabled {
-        let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-        reg(&[
-            "add",
-            RUN_KEY_CMD,
-            "/v",
-            RUN_NAME,
-            "/t",
-            "REG_SZ",
-            "/d",
-            &format!("\"{}\"", exe.display()),
-            "/f",
-        ])?;
-    } else {
-        let _ = reg(&["delete", RUN_KEY_CMD, "/v", RUN_NAME, "/f"]);
-    }
-    if autostart_enabled() != enabled {
-        return Err("开机启动没有写入成功，系统拒绝了这项修改".to_string());
-    }
-    Ok(())
+fn task_enabled() -> bool {
+    schtasks(&["/Query", "/TN", TASK_NAME]).is_ok()
+}
+
+fn ensure_run() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    reg(&[
+        "add",
+        RUN_KEY_CMD,
+        "/v",
+        RUN_NAME,
+        "/t",
+        "REG_SZ",
+        "/d",
+        &format!("\"{}\"", exe.display()),
+        "/f",
+    ])
+}
+
+fn remove_run() -> Result<(), String> {
+    reg(&["delete", RUN_KEY_CMD, "/v", RUN_NAME, "/f"])
+}
+
+fn ensure_task() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    // 登录后立刻启动，不进系统启动项那条延迟队列。只要当前用户，不要管理员。
+    schtasks(&[
+        "/Create",
+        "/TN",
+        TASK_NAME,
+        "/TR",
+        &format!("\"{}\"", exe.display()),
+        "/SC",
+        "ONLOGON",
+        "/IT",
+        "/F",
+    ])
+}
+
+fn remove_task() -> Result<(), String> {
+    schtasks(&["/Delete", "/TN", TASK_NAME, "/F"])
 }
 
 fn reg(args: &[&str]) -> Result<(), String> {
-    let output = Command::new(reg_exe())
+    run_tool(&reg_exe(), args, "开机启动修改失败")
+}
+
+fn schtasks(args: &[&str]) -> Result<(), String> {
+    run_tool(&schtasks_exe(), args, "优先加速启动修改失败")
+}
+
+fn run_tool(program: &str, args: &[&str], fallback: &str) -> Result<(), String> {
+    let output = Command::new(program)
         .args(args)
         .creation_flags(0x08000000)
         .output()
@@ -328,15 +401,23 @@ fn reg(args: &[&str]) -> Result<(), String> {
     let detail = String::from_utf8_lossy(&output.stderr);
     let detail = detail.trim();
     if detail.is_empty() {
-        Err("开机启动修改失败".to_string())
+        Err(fallback.to_string())
     } else {
         Err(detail.to_string())
     }
 }
 
-fn reg_exe() -> String {
+fn system32(name: &str) -> String {
     let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-    format!(r"{root}\System32\reg.exe")
+    format!(r"{root}\System32\{name}")
+}
+
+fn reg_exe() -> String {
+    system32("reg.exe")
+}
+
+fn schtasks_exe() -> String {
+    system32("schtasks.exe")
 }
 
 fn run_key() -> Result<RegKey, String> {
@@ -361,12 +442,21 @@ mod tests {
     #[test]
     fn autostart_round_trip() {
         let was = autostart_enabled();
-        set_autostart(true).expect("enable");
+        let was_fast = fast_autostart_enabled();
+        set_autostart(true, false).expect("enable");
         assert!(autostart_enabled());
-        set_autostart(false).expect("disable");
+        assert!(!fast_autostart_enabled());
+        set_autostart(true, true).expect("enable fast");
+        assert!(autostart_enabled());
+        assert!(fast_autostart_enabled());
+        set_autostart(true, false).expect("disable fast");
+        assert!(autostart_enabled());
+        assert!(!fast_autostart_enabled());
+        set_autostart(false, false).expect("disable");
         assert!(!autostart_enabled());
+        assert!(!fast_autostart_enabled());
         if was {
-            set_autostart(true).expect("restore");
+            set_autostart(true, was_fast).expect("restore");
         }
     }
     #[test]
@@ -390,6 +480,7 @@ mod tests {
         assert_eq!(saved.language, "zh");
         assert_eq!(saved.theme, "light");
         assert_eq!(saved.hint, "");
+        assert!(!saved.fast_autostart);
         assert_eq!(normalize_hint("  今天想打开什么  "), "今天想打开什么");
         assert_eq!(normalize_hint("123456789012345678901"), "12345678901234567890");
         assert_eq!(normalize_hint("a\nb"), "ab");

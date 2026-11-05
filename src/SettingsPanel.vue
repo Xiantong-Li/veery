@@ -1,7 +1,13 @@
+<script lang="ts">
+import type { SettingsInfo } from "./prefs";
+
+let cachedInfo: SettingsInfo | null = null;
+</script>
+
 <script setup lang="ts">
 import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import logo from "./assets/Veery-Log_compressed.png";
 import {
   applyTheme,
@@ -11,12 +17,24 @@ import {
   languageOf,
   prefsKey,
   themeOf,
-  watchSystemTheme,
   type Language,
   type SettingsInfo,
   type ThemeChoice,
   type UpdateInfo,
 } from "./prefs";
+
+const props = defineProps<{
+  language: Language;
+  theme: ThemeChoice;
+  hint: string;
+}>();
+
+const emit = defineEmits<{
+  languageChange: [Language];
+  themeChange: [ThemeChoice];
+  hintChange: [string];
+  recordingChange: [boolean];
+}>();
 
 const page = ref<"general" | "about">("general");
 const menuEl = ref<HTMLElement | null>(null);
@@ -24,18 +42,17 @@ const generalEl = ref<HTMLButtonElement | null>(null);
 const aboutEl = ref<HTMLButtonElement | null>(null);
 const selectionReady = ref(false);
 const selection = ref({ y: 0, height: 0 });
-const initial = inject(prefsKey, null);
-const info = ref<SettingsInfo | null>(initial);
-const language = ref<Language>(languageOf(initial?.language));
-const theme = ref<ThemeChoice>(themeOf(initial?.theme));
+const info = ref<SettingsInfo | null>(cachedInfo ?? inject(prefsKey, null));
+const switchReady = ref(false);
 const recording = ref(false);
 const message = ref("");
 const checking = ref(false);
 const updateState = ref<"idle" | "checking" | "current" | "available" | "failed">("idle");
 const latestVersion = ref("");
 const updateUrl = ref("");
+const hintDraft = ref(props.hint);
 
-const t = computed(() => copy(language.value));
+const t = computed(() => copy(props.language));
 const updateText = computed(() => {
   if (updateState.value === "checking") return t.value.checking;
   if (updateState.value === "current") return t.value.current;
@@ -43,31 +60,101 @@ const updateText = computed(() => {
   if (updateState.value === "failed") return t.value.failed;
   return "";
 });
+const selectionStyle = computed(() => ({
+  height: `${selection.value.height}px`,
+  transform: `translate3d(0, ${selection.value.y}px, 0)`,
+}));
+
+watch(
+  () => props.hint,
+  (value) => {
+    hintDraft.value = value;
+  },
+);
+
+watch(recording, (value) => emit("recordingChange", value));
+
+watch(page, () => {
+  void nextTick(moveSelection);
+});
+
+watch(
+  () => props.language,
+  () => {
+    void nextTick(moveSelection);
+  },
+);
+
+function moveSelection() {
+  const button = page.value === "general" ? generalEl.value : aboutEl.value;
+  if (!button) return;
+  selection.value = { y: button.offsetTop, height: button.offsetHeight };
+}
 
 async function load() {
-  info.value = await invoke<SettingsInfo>("get_settings");
-  language.value = languageOf(info.value.language);
-  theme.value = themeOf(info.value.theme);
-  applyTheme(theme.value);
-  document.documentElement.lang = language.value;
+  const next = await invoke<SettingsInfo>("get_settings");
+  cachedInfo = next;
+  info.value = next;
+  hintDraft.value = next.hint;
+  emit("hintChange", next.hint);
+  emit("languageChange", languageOf(next.language));
+  emit("themeChange", themeOf(next.theme));
+  await nextTick();
+  requestAnimationFrame(() => {
+    switchReady.value = true;
+  });
 }
 
 let autostartWrite = Promise.resolve();
 let autostartTicket = 0;
+let fastAutostartTicket = 0;
 
 function toggleAutostart() {
   if (!info.value) return;
   const enabled = !info.value.autostart;
+  const previousFast = info.value.fastAutostart;
   const mine = ++autostartTicket;
   info.value.autostart = enabled;
+  if (!enabled) info.value.fastAutostart = false;
+  cachedInfo = info.value;
   message.value = "";
   autostartWrite = autostartWrite.then(async () => {
     try {
       await invoke("set_autostart", { enabled });
-      if (mine === autostartTicket && info.value) info.value.autostart = enabled;
+      if (mine !== autostartTicket || !info.value) return;
+      info.value.autostart = enabled;
+      if (!enabled) info.value.fastAutostart = false;
+      cachedInfo = info.value;
+      if (enabled) await load();
     } catch (cause) {
       if (mine === autostartTicket && info.value) {
         info.value.autostart = !enabled;
+        info.value.fastAutostart = previousFast;
+        cachedInfo = info.value;
+        message.value = String(cause);
+      }
+    }
+  });
+}
+
+function toggleFastAutostart() {
+  if (!info.value?.autostart) return;
+  const enabled = !info.value.fastAutostart;
+  const mine = ++fastAutostartTicket;
+  info.value.fastAutostart = enabled;
+  cachedInfo = info.value;
+  message.value = "";
+  autostartWrite = autostartWrite.then(async () => {
+    try {
+      await invoke("set_fast_autostart", { enabled });
+      if (mine === fastAutostartTicket && info.value) {
+        info.value.fastAutostart = enabled;
+        cachedInfo = info.value;
+      }
+    } catch (cause) {
+      if (mine === fastAutostartTicket && info.value) {
+        info.value.fastAutostart = !enabled;
+        cachedInfo = info.value;
         message.value = String(cause);
       }
     }
@@ -75,8 +162,8 @@ function toggleAutostart() {
 }
 
 async function chooseLanguage(next: Language) {
-  if (language.value === next) return;
-  language.value = next;
+  if (props.language === next) return;
+  emit("languageChange", next);
   document.documentElement.lang = next;
   message.value = "";
   try {
@@ -88,14 +175,28 @@ async function chooseLanguage(next: Language) {
 }
 
 async function chooseTheme(next: ThemeChoice) {
-  if (theme.value === next) return;
-  theme.value = next;
+  if (props.theme === next) return;
+  emit("themeChange", next);
   applyTheme(next);
   message.value = "";
   try {
     await invoke("set_theme", { theme: next });
     if (info.value) info.value.theme = next;
   } catch (cause) {
+    message.value = String(cause);
+  }
+}
+
+async function saveHint() {
+  const previous = props.hint;
+  const next = hintDraft.value.trim();
+  message.value = "";
+  try {
+    const saved = await invoke<string>("set_search_hint", { hint: next });
+    hintDraft.value = saved;
+    emit("hintChange", saved);
+  } catch (cause) {
+    hintDraft.value = previous;
     message.value = String(cause);
   }
 }
@@ -107,12 +208,8 @@ async function checkUpdate() {
   try {
     const result = await invoke<UpdateInfo>("check_update");
     latestVersion.value = result.latest.replace(/^v/, "");
-    if (result.available) {
-      updateState.value = "available";
-      updateUrl.value = result.url;
-    } else {
-      updateState.value = "current";
-    }
+    updateState.value = result.available ? "available" : "current";
+    updateUrl.value = result.available ? result.url : "";
   } catch {
     updateState.value = "failed";
   } finally {
@@ -136,8 +233,30 @@ async function startRecording() {
 }
 
 async function stopRecording() {
+  if (!recording.value) return;
   recording.value = false;
   await invoke("restore_shortcut");
+}
+
+function sameShortcut(next: string, current: string) {
+  const token = (part: string) => {
+    switch (part.trim().toUpperCase()) {
+      case "CONTROL":
+        return "CTRL";
+      case "META":
+        return "SUPER";
+      default:
+        return part.trim().toUpperCase();
+    }
+  };
+  const fold = (value: string) =>
+    value
+      .split("+")
+      .map(token)
+      .filter(Boolean)
+      .sort()
+      .join("+");
+  return fold(next) === fold(current);
 }
 
 async function onKeydown(event: KeyboardEvent) {
@@ -186,54 +305,11 @@ async function onKeydown(event: KeyboardEvent) {
   }
 }
 
-const selectionStyle = computed(() => ({
-  height: `${selection.value.height}px`,
-  transform: `translate3d(0, ${selection.value.y}px, 0)`,
-}));
-
-function moveSelection() {
-  const button = page.value === "general" ? generalEl.value : aboutEl.value;
-  if (!button) return;
-  selection.value = { y: button.offsetTop, height: button.offsetHeight };
-}
-
-function sameShortcut(next: string, current: string) {
-  const token = (part: string) => {
-    switch (part.trim().toUpperCase()) {
-      case "CONTROL":
-        return "CTRL";
-      case "META":
-        return "SUPER";
-      default:
-        return part.trim().toUpperCase();
-    }
-  };
-  const fold = (value: string) =>
-    value
-      .split("+")
-      .map(token)
-      .filter(Boolean)
-      .sort()
-      .join("+");
-  return fold(next) === fold(current);
-}
-
+const stops: UnlistenFn[] = [];
 let menuObserver: ResizeObserver | null = null;
-let stopAltSpace: (() => void) | null = null;
-let stopAppearance: (() => void) | null = null;
-let stopThemeWatch: (() => void) | null = null;
-
-watch(page, () => {
-  void nextTick(moveSelection);
-});
-
-watch(language, () => {
-  void nextTick(moveSelection);
-});
 
 onMounted(() => {
-  window.addEventListener("keydown", onKeydown);
-  stopThemeWatch = watchSystemTheme(() => theme.value);
+  window.addEventListener("keydown", onKeydown, true);
   void nextTick(() => {
     moveSelection();
     requestAnimationFrame(() => {
@@ -244,50 +320,41 @@ onMounted(() => {
     menuObserver = new ResizeObserver(() => moveSelection());
     menuObserver.observe(menuEl.value);
   }
+  void load().catch((cause: unknown) => {
+    message.value = String(cause);
+  });
   void listen<{ ctrl: boolean; shift: boolean; alt: boolean }>("alt-space", (event) => {
     if (!recording.value) return;
-    const mods = event.payload;
     void onKeydown(
       new KeyboardEvent("keydown", {
         key: " ",
         code: "Space",
-        ctrlKey: mods.ctrl,
-        shiftKey: mods.shift,
-        altKey: mods.alt,
+        ctrlKey: event.payload.ctrl,
+        shiftKey: event.payload.shift,
+        altKey: event.payload.alt,
         cancelable: true,
       }),
     );
-  })
-    .then((stop) => {
-      stopAltSpace = stop;
-    })
-    .catch((cause: unknown) => {
-      message.value = String(cause);
-    });
-  void listen<{ language: string; theme: string }>("appearance", (event) => {
-    language.value = languageOf(event.payload.language);
-    theme.value = themeOf(event.payload.theme);
-    applyTheme(theme.value);
-    document.documentElement.lang = language.value;
-  })
-    .then((stop) => {
-      stopAppearance = stop;
-    })
-    .catch(() => undefined);
-  if (!info.value) void load();
+  }).then((stop) => stops.push(stop));
 });
 
 onUnmounted(() => {
   menuObserver?.disconnect();
-  window.removeEventListener("keydown", onKeydown);
-  stopAltSpace?.();
-  stopAppearance?.();
-  stopThemeWatch?.();
+  window.removeEventListener("keydown", onKeydown, true);
+  for (const stop of stops) stop();
+  void stopRecording();
+});
+
+defineExpose({
+  stopRecording,
+  get recording() {
+    return recording.value;
+  },
 });
 </script>
 
 <template>
-  <main class="settings">
+  <div class="settings">
     <aside>
       <img class="brand" :src="logo" alt="Veery" />
       <nav ref="menuEl" class="sidebar">
@@ -305,7 +372,8 @@ onUnmounted(() => {
         </button>
       </nav>
     </aside>
-    <section v-if="page === 'general'" class="panel">
+
+    <section v-if="page === 'general'" class="pane">
       <h1>{{ t.general }}</h1>
       <div class="row">
         <div>
@@ -315,9 +383,25 @@ onUnmounted(() => {
         <button
           type="button"
           class="switch"
-          :class="{ on: info?.autostart }"
+          :class="{ on: info?.autostart, ready: switchReady }"
           :aria-pressed="info?.autostart"
           @click="toggleAutostart"
+        >
+          <span></span>
+        </button>
+      </div>
+      <div class="row" :class="{ dim: !info?.autostart }">
+        <div>
+          <p class="title">{{ t.fastAutostart }}</p>
+          <p class="desc">{{ t.fastAutostartDesc }}</p>
+        </div>
+        <button
+          type="button"
+          class="switch"
+          :class="{ on: info?.fastAutostart, muted: !info?.autostart, ready: switchReady }"
+          :aria-pressed="info?.fastAutostart"
+          :disabled="!info?.autostart"
+          @click="toggleFastAutostart"
         >
           <span></span>
         </button>
@@ -330,6 +414,21 @@ onUnmounted(() => {
         <button type="button" class="key" :class="{ recording }" @click="startRecording">
           {{ recording ? t.pressShortcut : info?.shortcutLabel || t.loading }}
         </button>
+      </div>
+      <div class="row">
+        <div>
+          <p class="title">{{ t.hint }}</p>
+          <p class="desc">{{ t.hintDesc }}</p>
+        </div>
+        <input
+          v-model="hintDraft"
+          class="hint"
+          maxlength="20"
+          spellcheck="false"
+          :placeholder="t.search"
+          @keydown.enter.prevent="saveHint"
+          @blur="saveHint"
+        />
       </div>
       <div class="row">
         <div>
@@ -360,9 +459,10 @@ onUnmounted(() => {
       </div>
       <p v-if="message" class="message">{{ message }}</p>
     </section>
-    <section v-else class="panel">
+
+    <section v-else class="pane">
       <h1>{{ t.about }}</h1>
-      <p class="name">{{ info?.name }}</p>
+      <p class="name">{{ info?.name || "Veery" }}</p>
       <p class="summary">{{ t.summary }}</p>
       <dl>
         <div>
@@ -395,88 +495,31 @@ onUnmounted(() => {
       </div>
       <p v-if="message" class="message">{{ message }}</p>
     </section>
-  </main>
+  </div>
 </template>
 
-<style>
-html,
-body,
-#app {
-  height: 100%;
-  margin: 0;
-  background: var(--bg);
-  color: var(--text);
-}
-
-html[data-theme="dark"] {
-  color-scheme: dark;
-  --bg: #1c1c1c;
-  --surface: #2a2a2a;
-  --line: #3a3a3a;
-  --text: #f2f2f2;
-  --muted: #a3a3a3;
-  --strong: #ffffff;
-  --menu: #d4d4d4;
-  --indicator: #3a3a3a;
-  --choice: #333333;
-  --switch: #4a4a4a;
-  --switch-on: #f2f2f2;
-  --knob: #f2f2f2;
-  --knob-on: #1c1c1c;
-  --key-bg: #333333;
-  --key-line: #4a4a4a;
-  --key-text: #f2f2f2;
-  --danger: #ffb4ab;
-}
-
-html[data-theme="light"],
-html:not([data-theme]) {
-  color-scheme: light;
-  --bg: #f6f6f6;
-  --surface: #ffffff;
-  --line: #ececec;
-  --text: #2a2a2a;
-  --muted: #8a8a8a;
-  --strong: #1a1a1a;
-  --menu: #4a4a4a;
-  --indicator: #f3f3f3;
-  --choice: #f3f3f3;
-  --switch: #dedede;
-  --switch-on: #2a2a2a;
-  --knob: #ffffff;
-  --knob-on: #ffffff;
-  --key-bg: #fafafa;
-  --key-line: #e6e6e6;
-  --key-text: #1f1f1f;
-  --danger: #b42318;
-}
-
-body {
-  font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-  color: var(--text);
-  -webkit-font-smoothing: antialiased;
-}
-
+<style scoped>
 .settings {
   display: flex;
-  height: 100%;
-  min-height: 100%;
+  height: 400px;
+  color: var(--panel-text);
+  background: var(--sheet);
 }
 
 aside {
   box-sizing: border-box;
-  width: 180px;
+  width: 168px;
   flex: none;
-  padding: 22px 12px;
-  background: var(--surface);
-  border-right: 1px solid var(--line);
+  padding: 18px 10px;
+  background: transparent;
+  border-right: 1px solid var(--panel-line);
 }
 
 .brand {
   display: block;
-  width: 132px;
+  width: 118px;
   height: auto;
-  margin: 0 8px 18px;
+  margin: 0 6px 16px;
 }
 
 .sidebar {
@@ -490,7 +533,7 @@ aside {
   right: 0;
   top: 0;
   border-radius: 8px;
-  background: var(--indicator);
+  background: var(--panel-indicator);
   opacity: 0;
   pointer-events: none;
 }
@@ -511,7 +554,7 @@ aside button {
   border: 0;
   border-radius: 8px;
   background: transparent;
-  color: var(--menu);
+  color: var(--panel-menu);
   font: inherit;
   font-size: 14px;
   text-align: left;
@@ -521,25 +564,20 @@ aside button {
 }
 
 aside button.current {
-  color: var(--strong);
+  color: var(--panel-strong);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .indicator.ready,
-  aside button {
-    transition: none;
-  }
-}
-
-.panel {
+.pane {
   flex: 1;
-  padding: 28px 32px;
+  min-width: 0;
+  padding: 22px 28px 20px;
   overflow: auto;
 }
 
 h1 {
-  margin: 0 0 22px;
-  font-size: 22px;
+  margin: 0 0 18px;
+  color: var(--panel-strong);
+  font-size: 20px;
   font-weight: 600;
 }
 
@@ -548,23 +586,28 @@ h1 {
   align-items: center;
   justify-content: space-between;
   gap: 24px;
-  margin: 0 0 18px;
-  padding: 16px 18px;
+  margin: 0 0 14px;
+  padding: 14px 16px;
   border-radius: 12px;
-  background: var(--surface);
+  background: var(--panel-row);
+}
+
+.row.dim {
+  opacity: 0.55;
 }
 
 .title {
   margin: 0 0 4px;
-  font-size: 15px;
+  color: var(--panel-strong);
+  font-size: 14px;
 }
 
 .desc,
 .summary {
   margin: 0;
-  color: var(--muted);
-  font-size: 13px;
-  line-height: 1.6;
+  color: var(--panel-muted);
+  font-size: 12px;
+  line-height: 1.55;
 }
 
 .switch {
@@ -574,7 +617,7 @@ h1 {
   position: relative;
   border: 0;
   border-radius: 99px;
-  background: var(--switch);
+  background: var(--panel-switch);
   cursor: pointer;
 }
 
@@ -585,28 +628,37 @@ h1 {
   width: 20px;
   height: 20px;
   border-radius: 50%;
-  background: var(--knob);
+  background: var(--panel-knob);
+}
+
+.switch.ready span {
   transition: transform 0.15s ease;
 }
 
 .switch.on {
-  background: var(--switch-on);
+  background: var(--panel-switch-on);
 }
 
 .switch.on span {
-  background: var(--knob-on);
+  background: var(--panel-knob-on);
   transform: translateX(18px);
+}
+
+.switch.muted,
+.switch:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .key {
   flex: none;
   min-width: 132px;
-  border: 1px solid var(--key-line);
+  border: 1px solid var(--panel-line);
   border-radius: 8px;
-  background: var(--key-bg);
-  color: var(--key-text);
+  background: var(--panel-key);
+  color: var(--panel-strong);
   font: inherit;
-  font-size: 14px;
+  font-size: 13px;
   padding: 8px 14px;
   cursor: pointer;
 }
@@ -617,23 +669,37 @@ h1 {
 }
 
 .key.recording {
-  border-color: var(--strong);
+  border-color: var(--panel-strong);
+}
+
+.hint {
+  width: 168px;
+  flex: none;
+  box-sizing: border-box;
+  border: 1px solid var(--panel-line);
+  border-radius: 8px;
+  background: var(--panel-key);
+  color: var(--panel-strong);
+  font: inherit;
+  font-size: 13px;
+  padding: 8px 12px;
+  outline: none;
 }
 
 .choices {
   display: flex;
   flex: none;
   padding: 3px;
-  border: 1px solid var(--key-line);
+  border: 1px solid var(--panel-line);
   border-radius: 8px;
-  background: var(--choice);
+  background: var(--panel-choice);
 }
 
 .choices button {
   border: 0;
   border-radius: 6px;
   background: transparent;
-  color: var(--muted);
+  color: var(--panel-muted);
   font: inherit;
   font-size: 13px;
   padding: 6px 10px;
@@ -641,29 +707,30 @@ h1 {
 }
 
 .choices button.on {
-  background: var(--surface);
-  color: var(--strong);
+  background: var(--sheet);
+  color: var(--panel-strong);
 }
 
 .message {
   margin: 0;
-  color: var(--danger);
+  color: var(--error);
   font-size: 13px;
 }
 
 .name {
-  margin: 0 0 10px;
-  font-size: 28px;
+  margin: 0 0 8px;
+  color: var(--panel-strong);
+  font-size: 26px;
   font-weight: 600;
 }
 
 .summary {
-  max-width: 460px;
-  margin-bottom: 22px;
+  max-width: 520px;
+  margin-bottom: 18px;
 }
 
 dl {
-  margin: 0 0 22px;
+  margin: 0 0 18px;
 }
 
 dl div {
@@ -675,12 +742,15 @@ dl div {
 dt {
   width: 72px;
   flex: none;
-  color: var(--muted);
+  color: var(--panel-muted);
+  font-size: 13px;
 }
 
 dd {
   margin: 0;
   min-width: 0;
+  color: var(--panel-strong);
+  font-size: 13px;
 }
 
 .link {
@@ -697,6 +767,14 @@ dd {
 .update {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .indicator.ready,
+  aside button {
+    transition: none;
+  }
 }
 </style>
