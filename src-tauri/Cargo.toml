@@ -1,6 +1,6 @@
 [package]
 name = "veery"
-version = "0.2.6"
+version = "0.2.7"
 description = "A small Windows launcher"
 authors = ["Xiantong Li"]
 license = "MIT"
