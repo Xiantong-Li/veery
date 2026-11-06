@@ -737,11 +737,11 @@ fn set_fast_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     if enabled && !settings::autostart_enabled() {
         return Err("请先打开开机启动".to_string());
     }
-    settings::save_fast_autostart(&app, enabled)?;
-    if !settings::autostart_enabled() {
-        return Ok(());
+    // 先改系统项，成功后再记偏好，避免写入失败时开关和真实状态不一致。
+    if settings::autostart_enabled() {
+        settings::set_autostart(true, enabled)?;
     }
-    settings::set_autostart(true, enabled)
+    settings::save_fast_autostart(&app, enabled)
 }
 
 #[tauri::command]
