@@ -509,7 +509,10 @@ fn store_catalog(state: &AppState, scanned: Result<Vec<catalog::AppEntry>, Strin
             icons.ready.retain(|path, _| paths.contains(path));
         }
         Err(error) => {
+            // 正式版绝不能往控制台打日志：旧开机项若经 cmd 拉起，用户会看到黑框刷索引文字。
+            #[cfg(debug_assertions)]
             eprintln!("veery: 索引扫描失败，继续使用上一份索引: {error}");
+            let _ = error;
             if !state.index_ready.load(Ordering::Acquire) {
                 state.index_ready.store(true, Ordering::Release);
             }
@@ -519,6 +522,7 @@ fn store_catalog(state: &AppState, scanned: Result<Vec<catalog::AppEntry>, Strin
 
 fn reload_catalog(app: &AppHandle) {
     let scanned = catalog::scan();
+    #[cfg(debug_assertions)]
     if let Ok(apps) = scanned.as_ref() {
         eprintln!("veery: 已索引 {} 个开始菜单程序", apps.len());
     }
@@ -671,11 +675,10 @@ fn set_launcher_frame(window: tauri::WebviewWindow, mode: String) {
 fn get_settings(app: AppHandle) -> settings::SettingsInfo {
     let mut prefs = settings::load(&app);
     prefs.shortcut = saved_shortcut(&app);
-    settings::info(
-        settings::autostart_enabled(),
-        settings::fast_autostart_enabled(),
-        &prefs,
-    )
+    let autostart = settings::autostart_enabled();
+    // 两个开关互相独立：界面上的「优先加速」只看用户有没有打开它，不拿系统延迟值反推。
+    let fast = autostart && prefs.fast_autostart;
+    settings::info(autostart, fast, &prefs)
 }
 
 #[tauri::command]
@@ -723,13 +726,21 @@ fn open_link(app: AppHandle, url: String) -> Result<(), String> {
 
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
+    // 用户一动开机项就顺手清旧任务，避免下一次登录还弹黑框。
+    settings::spawn_legacy_task_cleanup();
     if !enabled {
-        // 关掉开机启动时一并清掉优先偏好，避免下次只开自启又悄悄挂上计划任务。
-        settings::save_fast_autostart(&app, false)?;
-        return settings::set_autostart(false, false);
+        // 关掉开机启动时，优先加速也一并关掉（没有自启就谈不上加速）。
+        if settings::load(&app).fast_autostart {
+            let _ = settings::apply_fast_autostart(false);
+            settings::save_fast_autostart(&app, false)?;
+        }
+        return settings::set_autostart(false);
     }
-    let fast = settings::load(&app).fast_autostart;
-    settings::set_autostart(true, fast)
+    // 只开自启，绝不开优先加速；清掉旧版可能残留的开关状态，避免下次启动又写上延迟。
+    if settings::load(&app).fast_autostart {
+        settings::save_fast_autostart(&app, false)?;
+    }
+    settings::set_autostart(true)
 }
 
 #[tauri::command]
@@ -737,10 +748,7 @@ fn set_fast_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
     if enabled && !settings::autostart_enabled() {
         return Err("请先打开开机启动".to_string());
     }
-    // 先改系统项，成功后再记偏好，避免写入失败时开关和真实状态不一致。
-    if settings::autostart_enabled() {
-        settings::set_autostart(true, enabled)?;
-    }
+    settings::apply_fast_autostart(enabled)?;
     settings::save_fast_autostart(&app, enabled)
 }
 
@@ -825,14 +833,26 @@ pub fn run() {
                     *current = fallback;
                 }
             }
+            // 先清旧版登录任务，避免继续经 cmd 弹黑框；不挡启动。
+            settings::spawn_legacy_task_cleanup();
             if let Err(error) = install_tray(app) {
+                #[cfg(debug_assertions)]
                 eprintln!("veery: 托盘创建失败: {error}");
+                let _ = error;
             }
-            // 旧版优先任务可能因错误引号在登录时闪黑框；若仍开着开机启动，启动时按偏好重写一次。
+            // 仍开着开机启动时，校正 Run 路径；优先加速只有用户开过才重写延迟。
             if settings::autostart_enabled() {
-                let fast = settings::load(app.handle()).fast_autostart;
-                if let Err(error) = settings::set_autostart(true, fast) {
+                if let Err(error) = settings::set_autostart(true) {
+                    #[cfg(debug_assertions)]
                     eprintln!("veery: 开机启动修复失败: {error}");
+                    let _ = error;
+                }
+                if settings::load(app.handle()).fast_autostart {
+                    if let Err(error) = settings::apply_fast_autostart(true) {
+                        #[cfg(debug_assertions)]
+                        eprintln!("veery: 优先加速启动修复失败: {error}");
+                        let _ = error;
+                    }
                 }
             }
             if let Some(window) = app.get_webview_window("main") {

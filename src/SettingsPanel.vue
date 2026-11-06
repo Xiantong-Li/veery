@@ -133,9 +133,9 @@ function toggleAutostart() {
       await invoke("set_autostart", { enabled });
       if (mine !== autostartTicket || !info.value) return;
       info.value.autostart = enabled;
+      // 只开自启时不要 load() 反推优先加速；关自启才顺带关加速。
       if (!enabled) info.value.fastAutostart = false;
       settingsPanelCache.value = info.value;
-      if (enabled) await load();
     } catch (cause) {
       if (mine === autostartTicket && info.value) {
         info.value.autostart = !enabled;

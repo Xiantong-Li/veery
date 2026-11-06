@@ -1,5 +1,5 @@
-// Prevents additional console window on Windows in release, DO NOT REMOVE!!
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// 必须是 windows 子系统：一旦写进开机启动，console 子系统会在登录时弹黑框。
+#![windows_subsystem = "windows"]
 
 fn main() {
     veery_lib::run()
