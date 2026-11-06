@@ -141,7 +141,7 @@ function toggleAutostart() {
         info.value.autostart = !enabled;
         info.value.fastAutostart = previousFast;
         settingsPanelCache.value = info.value;
-        message.value = String(cause);
+        message.value = errorText(cause);
       }
     }
   });
@@ -165,10 +165,19 @@ function toggleFastAutostart() {
       if (mine === fastAutostartTicket && info.value) {
         info.value.fastAutostart = !enabled;
         settingsPanelCache.value = info.value;
-        message.value = String(cause);
+        message.value = errorText(cause);
       }
     }
   });
+}
+
+function errorText(cause: unknown): string {
+  if (typeof cause === "string") return cause;
+  if (cause && typeof cause === "object" && "message" in cause) {
+    const message = (cause as { message: unknown }).message;
+    if (typeof message === "string" && message.trim()) return message;
+  }
+  return String(cause);
 }
 
 async function chooseLanguage(next: Language) {
@@ -180,7 +189,7 @@ async function chooseLanguage(next: Language) {
     await invoke("set_language", { language: next });
     await load();
   } catch (cause) {
-    message.value = String(cause);
+    message.value = errorText(cause);
   }
 }
 

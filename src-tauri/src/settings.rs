@@ -1,5 +1,5 @@
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
@@ -365,30 +365,91 @@ fn ensure_run() -> Result<(), String> {
 
 fn ensure_task() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    let path = exe.to_string_lossy();
     // 先删掉可能写坏的旧任务（错误加引号时，登录会经 cmd 闪黑框）。
     let _ = remove_task();
-    // /TR 交给 Command 传参即可，不要再包一层引号；多包一层会被计划任务当成
-    // 要交给 cmd 执行的命令行，开机就会弹出黑窗口。
-    // /SC ONLOGON /IT：当前用户登录后立刻跑，尽量不进开机延迟队列。
-    schtasks(&[
-        "/Create",
-        "/TN",
-        TASK_NAME,
-        "/TR",
-        path.as_ref(),
-        "/SC",
-        "ONLOGON",
-        "/RL",
-        "LIMITED",
-        "/IT",
-        "/F",
-    ])?;
+    // 用 XML 导入，避免 /TR 在不同系统语言、路径空格下被拆坏或包成 cmd。
+    create_task_from_xml(&exe)?;
+    if !task_enabled() {
+        let _ = remove_task();
+        return Err("优先加速启动没有写入成功，系统拒绝了这项修改".to_string());
+    }
     if !task_action_is_safe(&exe) {
         let _ = remove_task();
         return Err("优先加速启动写入异常，已取消，以免开机弹出黑窗口".to_string());
     }
     Ok(())
+}
+
+fn create_task_from_xml(exe: &Path) -> Result<(), String> {
+    let xml = task_definition_xml(exe);
+    let file = std::env::temp_dir().join(format!("veery-startup-{}.xml", std::process::id()));
+    write_utf16_le_file(&file, &xml)?;
+    let xml_path = file.to_string_lossy().into_owned();
+    let result = schtasks(&["/Create", "/TN", TASK_NAME, "/XML", &xml_path, "/F"]);
+    let _ = std::fs::remove_file(&file);
+    result
+}
+
+fn task_definition_xml(exe: &Path) -> String {
+    let command = xml_escape(&exe.to_string_lossy());
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>{command}</Command>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
+fn write_utf16_le_file(path: &Path, text: &str) -> Result<(), String> {
+    let mut bytes = Vec::with_capacity(2 + text.len() * 2);
+    bytes.extend_from_slice(&[0xFF, 0xFE]);
+    for unit in text.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    std::fs::write(path, bytes).map_err(|error| format!("优先加速启动临时文件写入失败：{error}"))
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
 }
 
 fn remove_task() -> Result<(), String> {
@@ -408,7 +469,7 @@ fn remove_run() -> Result<(), String> {
 }
 
 /// 确认计划任务直接跑本程序，而不是 cmd/powershell（否则登录必闪黑框）。
-fn task_action_is_safe(exe: &std::path::Path) -> bool {
+fn task_action_is_safe(exe: &Path) -> bool {
     let Some(action) = task_action_command() else {
         return false;
     };
@@ -423,7 +484,7 @@ fn task_action_is_safe(exe: &std::path::Path) -> bool {
     {
         return false;
     }
-    let action_path = std::path::Path::new(normalized);
+    let action_path = Path::new(normalized);
     let is_exe = action_path
         .extension()
         .and_then(|ext| ext.to_str())
@@ -442,10 +503,21 @@ fn task_action_command() -> Option<String> {
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let start = text.find("<Command>")? + "<Command>".len();
-    let end = text[start..].find("</Command>")? + start;
-    Some(text[start..end].trim().to_string())
+    let text = decode_windows_bytes(&output.stdout);
+    extract_xml_command(&text)
+}
+
+fn extract_xml_command(text: &str) -> Option<String> {
+    let lower = text.to_ascii_lowercase();
+    let start_token = "<command>";
+    let end_token = "</command>";
+    let start = lower.find(start_token)? + start_token.len();
+    let end = lower[start..].find(end_token)? + start;
+    let raw = text[start..end].trim();
+    if raw.is_empty() {
+        return None;
+    }
+    Some(xml_unescape(raw))
 }
 
 fn reg(args: &[&str]) -> Result<(), String> {
@@ -467,12 +539,61 @@ fn run_tool(program: &str, args: &[&str], fallback: &str) -> Result<(), String> 
     if output.status.success() {
         return Ok(());
     }
-    let detail = String::from_utf8_lossy(&output.stderr);
-    let detail = detail.trim();
+    // schtasks/reg 在中文系统上常回 GBK，按 UTF-8 读会变成一串 �；有的错误在 stdout。
+    let detail = {
+        let err = decode_windows_bytes(&output.stderr);
+        if !err.is_empty() {
+            err
+        } else {
+            decode_windows_bytes(&output.stdout)
+        }
+    };
     if detail.is_empty() {
         Err(fallback.to_string())
     } else {
-        Err(detail.to_string())
+        Err(format!("{fallback}：{detail}"))
+    }
+}
+
+fn decode_windows_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    // schtasks /XML 有时是 UTF-16 LE（带或不带 BOM）。
+    if bytes.starts_with(&[0xFF, 0xFE])
+        || (bytes.len() >= 4 && bytes[0] != 0 && bytes[1] == 0 && bytes[2] != 0 && bytes[3] == 0)
+    {
+        let raw = if bytes.starts_with(&[0xFF, 0xFE]) {
+            &bytes[2..]
+        } else {
+            bytes
+        };
+        let wide: Vec<u16> = raw
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        return String::from_utf16_lossy(&wide).trim().to_string();
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return text.trim().to_string();
+    }
+    decode_acp(bytes)
+}
+
+fn decode_acp(bytes: &[u8]) -> String {
+    use windows::Win32::Globalization::{MultiByteToWideChar, CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
+
+    unsafe {
+        let needed = MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, None);
+        if needed <= 0 {
+            return String::from_utf8_lossy(bytes).trim().to_string();
+        }
+        let mut wide = vec![0u16; needed as usize];
+        let written = MultiByteToWideChar(CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0), bytes, Some(&mut wide));
+        if written <= 0 {
+            return String::from_utf8_lossy(bytes).trim().to_string();
+        }
+        String::from_utf16_lossy(&wide[..written as usize]).trim().to_string()
     }
 }
 
@@ -507,6 +628,38 @@ fn config_file(app: &AppHandle) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_gbk_console_errors() {
+        // “错误: 拒绝访问。” 的 GBK 字节；按 UTF-8 会读成替换符。
+        let gbk = [
+            0xB4u8, 0xED, 0xCE, 0xF3, 0x3A, 0x20, 0xBE, 0xDC, 0xBE, 0xF8, 0xB7, 0xC3, 0xCE, 0xCA, 0xA1, 0xA3,
+        ];
+        let text = decode_windows_bytes(&gbk);
+        assert!(text.contains('错') || text.contains("拒绝") || text.contains("访问"), "{text}");
+        assert!(!text.contains('\u{FFFD}'), "{text}");
+    }
+
+    #[test]
+    fn decodes_utf16_xml_and_extracts_command() {
+        let xml = "<?xml version=\"1.0\"?><Task><Actions><Exec><Command>C:\\Apps\\veery.exe</Command></Exec></Actions></Task>";
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in xml.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let text = decode_windows_bytes(&bytes);
+        assert_eq!(
+            extract_xml_command(&text).as_deref(),
+            Some(r"C:\Apps\veery.exe")
+        );
+        assert_eq!(
+            extract_xml_command("<COMMAND>D:\\a&amp;b\\veery.exe</COMMAND>").as_deref(),
+            Some(r"D:\a&b\veery.exe")
+        );
+        let definition = task_definition_xml(Path::new(r"D:\App Gallery\veery.exe"));
+        assert!(definition.contains(r"<Command>D:\App Gallery\veery.exe</Command>"));
+        assert!(!definition.contains("/TR"));
+    }
 
     #[test]
     fn autostart_round_trip() {
