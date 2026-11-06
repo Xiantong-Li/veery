@@ -1,4 +1,5 @@
 mod catalog;
+mod history;
 mod settings;
 mod update;
 
@@ -18,7 +19,6 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
 struct IconCache {
     ready: HashMap<PathBuf, String>,
-    pending: HashSet<PathBuf>,
 }
 
 struct TrayItems {
@@ -33,7 +33,9 @@ struct AppState {
     index_ready: AtomicBool,
     icons: Mutex<IconCache>,
     shown_at: Mutex<Instant>,
+    blur_until: Mutex<Instant>,
     settings_open: AtomicBool,
+    last_query: Mutex<String>,
     shortcut: Mutex<String>,
     tray: Mutex<Option<TrayItems>>,
 }
@@ -42,6 +44,14 @@ fn mark_shown(app: &AppHandle) {
     if let Some(state) = app.try_state::<AppState>() {
         if let Ok(mut shown_at) = state.shown_at.lock() {
             *shown_at = Instant::now();
+        }
+    }
+}
+
+fn mark_blur_guard(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut until) = state.blur_until.lock() {
+            *until = Instant::now() + Duration::from_millis(800);
         }
     }
 }
@@ -428,7 +438,10 @@ struct SearchResponse {
 }
 
 #[tauri::command]
-fn search(state: tauri::State<AppState>, query: String) -> SearchResponse {
+fn search(app: AppHandle, state: tauri::State<AppState>, query: String) -> SearchResponse {
+    if let Ok(mut last) = state.last_query.lock() {
+        *last = query.clone();
+    }
     if !state.index_ready.load(Ordering::Acquire) {
         return SearchResponse {
             ready: false,
@@ -437,24 +450,28 @@ fn search(state: tauri::State<AppState>, query: String) -> SearchResponse {
     }
     let mut hits = {
         let apps = state.index.lock().unwrap_or_else(|error| error.into_inner());
-        catalog::search(&apps, &query, 8)
+        catalog::search_with_boost(&apps, &query, 8, |q, path| history::boost_for(&app, q, path))
     };
     attach_icons(&state, &mut hits);
     SearchResponse { ready: true, hits }
 }
 
 fn attach_icons(state: &AppState, hits: &mut [catalog::SearchHit]) {
+    // 不用 pending 跳过提取：重叠的 search 会把路径标成“提取中”后直接返回空图标，
+    // 后完成的那次反而被前端丢掉，同一次查询就不会再要图标了。
     let mut missing = Vec::new();
     {
-        let mut icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
+        let icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
         for hit in hits.iter_mut() {
             if let Some(icon) = icons.ready.get(&hit.path) {
                 hit.icon = Some(icon.clone());
-            } else if icons.pending.insert(hit.path.clone()) {
+            } else {
                 missing.push(hit.path.clone());
             }
         }
     }
+    let mut seen = HashSet::new();
+    missing.retain(|path| seen.insert(path.clone()));
     let extracted: Vec<_> = missing
         .into_iter()
         .map(|path| {
@@ -464,7 +481,6 @@ fn attach_icons(state: &AppState, hits: &mut [catalog::SearchHit]) {
         .collect();
     let mut icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
     for (path, icon) in extracted {
-        icons.pending.remove(&path);
         if let Some(icon) = icon {
             icons.ready.insert(path, icon);
         }
@@ -491,7 +507,6 @@ fn store_catalog(state: &AppState, scanned: Result<Vec<catalog::AppEntry>, Strin
             state.index_ready.store(true, Ordering::Release);
             let mut icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
             icons.ready.retain(|path, _| paths.contains(path));
-            icons.pending.retain(|path| paths.contains(path));
         }
         Err(error) => {
             eprintln!("veery: 索引扫描失败，继续使用上一份索引: {error}");
@@ -512,6 +527,39 @@ fn reload_catalog(app: &AppHandle) {
     };
     store_catalog(&state, scanned);
     let _ = app.emit("catalog-ready", ());
+    warm_icons(app);
+}
+
+fn warm_icons(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("veery-icons".into())
+        .spawn(move || {
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            let paths: Vec<PathBuf> = {
+                let apps = state.index.lock().unwrap_or_else(|error| error.into_inner());
+                apps.iter().map(|app| app.path.clone()).collect()
+            };
+            for path in paths {
+                {
+                    let icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
+                    if icons.ready.contains_key(&path) {
+                        continue;
+                    }
+                }
+                let icon = catalog::icon_data_url(&path);
+                let mut icons = state.icons.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(icon) = icon {
+                    icons.ready.insert(path, icon);
+                }
+                if icons.ready.len() > 512 {
+                    break;
+                }
+            }
+        })
+        .ok();
 }
 
 #[tauri::command]
@@ -535,21 +583,49 @@ fn path_for(state: &AppState, id: u32) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-fn launch(window: tauri::WebviewWindow, state: tauri::State<AppState>, id: u32) -> Result<(), String> {
+fn launch(
+    app: AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<AppState>,
+    id: u32,
+    query: Option<String>,
+) -> Result<(), String> {
     close_before(&window, || {
         let path = path_for(&state, id)?;
+        let remembered = query
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                state
+                    .last_query
+                    .lock()
+                    .map(|value| value.clone())
+                    .unwrap_or_default()
+            });
+        let _ = history::record(&app, &remembered, &path);
         catalog::open_link(&path)
     })
 }
 
 #[tauri::command]
 fn launch_admin(
+    app: AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<AppState>,
     id: u32,
+    query: Option<String>,
 ) -> Result<(), String> {
     close_before(&window, || {
         let path = path_for(&state, id)?;
+        let remembered = query
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                state
+                    .last_query
+                    .lock()
+                    .map(|value| value.clone())
+                    .unwrap_or_default()
+            });
+        let _ = history::record(&app, &remembered, &path);
         catalog::open_elevated(&path)
     })
 }
@@ -639,15 +715,21 @@ async fn check_update() -> Result<update::UpdateInfo, String> {
 }
 
 #[tauri::command]
-fn open_link(url: String) -> Result<(), String> {
+fn open_link(app: AppHandle, url: String) -> Result<(), String> {
+    // 关于页打开外链会失焦；短时间内不要因此把窗口藏起来。
+    mark_blur_guard(&app);
     settings::open_link(&url)
 }
 
 #[tauri::command]
 fn set_autostart(app: AppHandle, enabled: bool) -> Result<(), String> {
-    // 关掉开机启动时保留「优先加速」偏好，下次打开仍按原样。
+    if !enabled {
+        // 关掉开机启动时一并清掉优先偏好，避免下次只开自启又悄悄挂上计划任务。
+        settings::save_fast_autostart(&app, false)?;
+        return settings::set_autostart(false, false);
+    }
     let fast = settings::load(&app).fast_autostart;
-    settings::set_autostart(enabled, enabled && fast)
+    settings::set_autostart(true, fast)
 }
 
 #[tauri::command]
@@ -718,10 +800,11 @@ pub fn run() {
                 index_ready: AtomicBool::new(false),
                 icons: Mutex::new(IconCache {
                     ready: HashMap::new(),
-                    pending: HashSet::new(),
                 }),
                 shown_at: Mutex::new(Instant::now() - Duration::from_secs(60)),
+                blur_until: Mutex::new(Instant::now() - Duration::from_secs(60)),
                 settings_open: AtomicBool::new(false),
+                last_query: Mutex::new(String::new()),
                 shortcut: Mutex::new(shortcut.clone()),
                 tray: Mutex::new(None),
             });
@@ -744,6 +827,13 @@ pub fn run() {
             }
             if let Err(error) = install_tray(app) {
                 eprintln!("veery: 托盘创建失败: {error}");
+            }
+            // 旧版优先任务可能因错误引号在登录时闪黑框；若仍开着开机启动，启动时按偏好重写一次。
+            if settings::autostart_enabled() {
+                let fast = settings::load(app.handle()).fast_autostart;
+                if let Err(error) = settings::set_autostart(true, fast) {
+                    eprintln!("veery: 开机启动修复失败: {error}");
+                }
             }
             if let Some(window) = app.get_webview_window("main") {
                 tune_webview(&window);
@@ -773,12 +863,12 @@ pub fn run() {
                             .map(|shown_at| shown_at.elapsed() < Duration::from_millis(300))
                     })
                     .unwrap_or(false);
-                let settings_open = state
+                let guarded = state
                     .as_ref()
-                    .map(|state| state.settings_open.load(Ordering::Acquire))
-                    .unwrap_or(false);
-                // 设置展开时点到外部链接会失焦，不能因此把面板关掉。
-                if !recent && !settings_open {
+                    .and_then(|state| state.blur_until.lock().ok())
+                    .is_some_and(|until| *until > Instant::now());
+                // 点桌面空白应隐藏（含设置中）；打开外链的短时失焦由 blur_until 挡住。
+                if !recent && !guarded {
                     hide_launcher(app);
                 }
             }

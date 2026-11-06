@@ -315,17 +315,22 @@ pub fn set_autostart(enabled: bool, fast: bool) -> Result<(), String> {
         }
         return Ok(());
     }
+    // 普通开机启动始终写 Run，和以前一样稳。优先加速是额外的登录任务，不能取代 Run，
+    // 否则任务写坏时用户会完全自启不了。
+    ensure_run()?;
+    if !run_enabled() {
+        return Err("开机启动没有写入成功，系统拒绝了这项修改".to_string());
+    }
     if fast {
         ensure_task()?;
-        let _ = remove_run();
         if !task_enabled() {
+            let _ = remove_task();
             return Err("优先加速启动没有写入成功，系统拒绝了这项修改".to_string());
         }
     } else {
-        ensure_run()?;
         let _ = remove_task();
-        if !run_enabled() {
-            return Err("开机启动没有写入成功，系统拒绝了这项修改".to_string());
+        if task_enabled() {
+            return Err("旧的优先启动项没有清掉，请再关一次优先加速启动".to_string());
         }
     }
     Ok(())
@@ -344,6 +349,7 @@ fn task_enabled() -> bool {
 
 fn ensure_run() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    // 注册表里的启动命令需要自带引号，路径有空格时才不会被拆开。
     reg(&[
         "add",
         RUN_KEY_CMD,
@@ -357,28 +363,89 @@ fn ensure_run() -> Result<(), String> {
     ])
 }
 
-fn remove_run() -> Result<(), String> {
-    reg(&["delete", RUN_KEY_CMD, "/v", RUN_NAME, "/f"])
-}
-
 fn ensure_task() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
-    // 登录后立刻启动，不进系统启动项那条延迟队列。只要当前用户，不要管理员。
+    let path = exe.to_string_lossy();
+    // 先删掉可能写坏的旧任务（错误加引号时，登录会经 cmd 闪黑框）。
+    let _ = remove_task();
+    // /TR 交给 Command 传参即可，不要再包一层引号；多包一层会被计划任务当成
+    // 要交给 cmd 执行的命令行，开机就会弹出黑窗口。
+    // /SC ONLOGON /IT：当前用户登录后立刻跑，尽量不进开机延迟队列。
     schtasks(&[
         "/Create",
         "/TN",
         TASK_NAME,
         "/TR",
-        &format!("\"{}\"", exe.display()),
+        path.as_ref(),
         "/SC",
         "ONLOGON",
+        "/RL",
+        "LIMITED",
         "/IT",
         "/F",
-    ])
+    ])?;
+    if !task_action_is_safe(&exe) {
+        let _ = remove_task();
+        return Err("优先加速启动写入异常，已取消，以免开机弹出黑窗口".to_string());
+    }
+    Ok(())
 }
 
 fn remove_task() -> Result<(), String> {
-    schtasks(&["/Delete", "/TN", TASK_NAME, "/F"])
+    match schtasks(&["/Delete", "/TN", TASK_NAME, "/F"]) {
+        Ok(()) => Ok(()),
+        Err(_) if !task_enabled() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn remove_run() -> Result<(), String> {
+    match reg(&["delete", RUN_KEY_CMD, "/v", RUN_NAME, "/f"]) {
+        Ok(()) => Ok(()),
+        Err(_) if !run_enabled() => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// 确认计划任务直接跑本程序，而不是 cmd/powershell（否则登录必闪黑框）。
+fn task_action_is_safe(exe: &std::path::Path) -> bool {
+    let Some(action) = task_action_command() else {
+        return false;
+    };
+    let normalized = action.trim().trim_matches('"').trim();
+    let lower = normalized.to_ascii_lowercase();
+    if lower.contains("cmd.exe")
+        || lower.contains("powershell")
+        || lower.contains("pwsh.exe")
+        || lower.contains("wscript")
+        || lower.contains("cscript")
+        || lower.contains("/c ")
+    {
+        return false;
+    }
+    let action_path = std::path::Path::new(normalized);
+    let is_exe = action_path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"));
+    is_exe && action_path.file_name() == exe.file_name()
+}
+
+fn task_action_command() -> Option<String> {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // XML 不受系统显示语言影响，比 LIST 文案更稳。
+    let output = Command::new(schtasks_exe())
+        .args(["/Query", "/TN", TASK_NAME, "/XML"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let start = text.find("<Command>")? + "<Command>".len();
+    let end = text[start..].find("</Command>")? + start;
+    Some(text[start..end].trim().to_string())
 }
 
 fn reg(args: &[&str]) -> Result<(), String> {
@@ -390,9 +457,11 @@ fn schtasks(args: &[&str]) -> Result<(), String> {
 }
 
 fn run_tool(program: &str, args: &[&str], fallback: &str) -> Result<(), String> {
+    // CREATE_NO_WINDOW：改设置时绝不能闪出 reg/schtasks 黑框。
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let output = Command::new(program)
         .args(args)
-        .creation_flags(0x08000000)
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| error.to_string())?;
     if output.status.success() {
@@ -441,23 +510,27 @@ mod tests {
 
     #[test]
     fn autostart_round_trip() {
-        let was = autostart_enabled();
-        let was_fast = fast_autostart_enabled();
+        // 测试进程是 veery_lib-*.exe，不能写回用户原来的开机项，否则登录会启动测试二进制并可能弹控制台。
+        let _ = set_autostart(false, false);
         set_autostart(true, false).expect("enable");
-        assert!(autostart_enabled());
+        assert!(run_enabled());
         assert!(!fast_autostart_enabled());
         set_autostart(true, true).expect("enable fast");
-        assert!(autostart_enabled());
+        assert!(run_enabled());
         assert!(fast_autostart_enabled());
+        let exe = std::env::current_exe().expect("exe");
+        assert!(task_action_is_safe(&exe), "task must run veery directly, not cmd");
+        let action = task_action_command().expect("task action");
+        let lower = action.to_ascii_lowercase();
+        assert!(!lower.contains("cmd.exe"), "{action}");
+        assert!(!lower.contains("powershell"), "{action}");
+        assert!(!action.trim_start().starts_with("\"\""), "over-quoted: {action}");
         set_autostart(true, false).expect("disable fast");
-        assert!(autostart_enabled());
+        assert!(run_enabled());
         assert!(!fast_autostart_enabled());
         set_autostart(false, false).expect("disable");
         assert!(!autostart_enabled());
         assert!(!fast_autostart_enabled());
-        if was {
-            set_autostart(true, was_fast).expect("restore");
-        }
     }
     #[test]
     fn shortcut_requires_a_modifier() {

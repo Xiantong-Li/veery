@@ -55,31 +55,47 @@ pub fn scan() -> Result<Vec<AppEntry>, String> {
 }
 
 pub fn search(apps: &[AppEntry], query: &str, limit: usize) -> Vec<SearchHit> {
+    search_with_boost(apps, query, limit, |_, _| (0, 0))
+}
+
+/// `boost` 返回 (加分, 最近使用时间)。同一查询下选过的程序会排得更靠前。
+pub fn search_with_boost(
+    apps: &[AppEntry],
+    query: &str,
+    limit: usize,
+    boost: impl Fn(&str, &Path) -> (i32, u64),
+) -> Vec<SearchHit> {
     let tokens: Vec<String> = query.split_whitespace().map(fold).filter(|token| !token.is_empty()).collect();
     if tokens.is_empty() || limit == 0 {
         return Vec::new();
     }
 
-    let mut best: Vec<(i32, &AppEntry)> = Vec::with_capacity(limit);
+    let mut best: Vec<(i32, u64, &AppEntry)> = Vec::with_capacity(limit);
     for app in apps {
-        let Some(value) = score_query(app, &tokens) else {
+        let Some(base) = score_query(app, &tokens) else {
             continue;
         };
-        let ahead = best.iter().position(|(kept_score, kept)| {
+        let (extra, last) = boost(query, &app.path);
+        let value = base.saturating_add(extra);
+        let ahead = best.iter().position(|(kept_score, kept_last, kept)| {
             value > *kept_score
-                || (value == *kept_score && app.folded < kept.folded)
-                || (value == *kept_score && app.folded == kept.folded && app.id < kept.id)
+                || (value == *kept_score && last > *kept_last)
+                || (value == *kept_score && last == *kept_last && app.folded < kept.folded)
+                || (value == *kept_score
+                    && last == *kept_last
+                    && app.folded == kept.folded
+                    && app.id < kept.id)
         });
         if let Some(index) = ahead {
-            best.insert(index, (value, app));
+            best.insert(index, (value, last, app));
             if best.len() > limit {
                 best.pop();
             }
         } else if best.len() < limit {
-            best.push((value, app));
+            best.push((value, last, app));
         }
     }
-    best.into_iter().map(|(_, app)| hit(app)).collect()
+    best.into_iter().map(|(_, _, app)| hit(app)).collect()
 }
 
 pub fn open_link(path: &Path) -> Result<(), String> {
@@ -245,6 +261,15 @@ fn is_shell_app(path: &Path) -> bool {
 fn app_path(parsing: &str) -> Option<PathBuf> {
     let parsing = parsing.trim();
     if parsing.is_empty() {
+        return None;
+    }
+    // AppsFolder 里会混进网页快捷方式，parsing 名就是 http(s) 地址，提不出图标也不该当程序。
+    let lower = parsing.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("ms-settings:")
+    {
         return None;
     }
     if parsing.contains('\\') || parsing.contains('/') {
@@ -670,8 +695,23 @@ fn hit(app: &AppEntry) -> SearchHit {
 
 pub fn icon_data_url(path: &Path) -> Option<String> {
     let png = file_icon_png(path)?;
+    if png_is_blank(&png) {
+        return None;
+    }
     let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png);
     Some(format!("data:image/png;base64,{encoded}"))
+}
+
+fn png_is_blank(png: &[u8]) -> bool {
+    let Ok(decoder) = png::Decoder::new(std::io::Cursor::new(png)).read_info() else {
+        return true;
+    };
+    let mut reader = decoder;
+    let mut buf = vec![0; reader.output_buffer_size()];
+    if reader.next_frame(&mut buf).is_err() {
+        return true;
+    }
+    !buf.chunks_exact(4).any(|pixel| pixel[3] > 8 && (pixel[0] | pixel[1] | pixel[2]) > 8)
 }
 
 fn file_icon_png(path: &Path) -> Option<Vec<u8>> {
@@ -720,15 +760,25 @@ fn shell_icon_png(path: &Path) -> Option<Vec<u8>> {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
         let item = SHCreateItemFromParsingName::<_, _, IShellItem>(PCWSTR(wide.as_ptr()), None::<&IBindCtx>).ok()?;
         let factory: IShellItemImageFactory = item.cast().ok()?;
-        let bitmap = factory
-            .GetImage(SIZE { cx: 32, cy: 32 }, SIIGBF(SIIGBF_BIGGERSIZEOK.0 | SIIGBF_ICONONLY.0))
-            .ok()?;
-        if bitmap.is_invalid() {
-            return None;
+        // 先要纯图标；部分 Store 应用在 ICONONLY 下会给出全透明图，再退回普通缩略图。
+        let flags = [
+            SIIGBF(SIIGBF_BIGGERSIZEOK.0 | SIIGBF_ICONONLY.0),
+            SIIGBF_BIGGERSIZEOK,
+        ];
+        for flag in flags {
+            let Ok(bitmap) = factory.GetImage(SIZE { cx: 32, cy: 32 }, flag) else {
+                continue;
+            };
+            if bitmap.is_invalid() {
+                continue;
+            }
+            let png = hbitmap_to_png(bitmap);
+            let _ = DeleteObject(bitmap.into());
+            if let Some(png) = png.filter(|png| !png_is_blank(png)) {
+                return Some(png);
+            }
         }
-        let png = hbitmap_to_png(bitmap);
-        let _ = DeleteObject(bitmap.into());
-        png
+        None
     }
 }
 
@@ -1011,6 +1061,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn app_path_skips_web_links() {
+        assert!(app_path("https://github.com/git-for-windows/git/wiki/FAQ").is_none());
+        assert!(app_path("http://localhost:8080/workspace").is_none());
+        assert!(app_path("mailto:someone@example.com").is_none());
+    }
+
     fn apps(names: &[&str]) -> Vec<AppEntry> {
         names
             .iter()
@@ -1086,6 +1143,22 @@ mod tests {
         let hits = search(&apps(&["BPS Work Client", "Clash Verge"]), "cl", 8);
         assert_eq!(hits[0].name, "Clash Verge");
         assert_eq!(hits[1].name, "BPS Work Client");
+    }
+
+    #[test]
+    fn preference_boost_can_reorder_same_tier_hits() {
+        let mut list = apps(&["Gimp", "Google Chrome"]);
+        list[0].path = PathBuf::from("C:\\apps\\gimp.exe");
+        list[1].path = PathBuf::from("C:\\apps\\chrome.exe");
+        let chrome = PathBuf::from("C:\\apps\\chrome.exe");
+        let hits = search_with_boost(&list, "g", 8, |_query, path| {
+            if path == &chrome {
+                (400, 9)
+            } else {
+                (0, 0)
+            }
+        });
+        assert_eq!(hits[0].name, "Google Chrome");
     }
 
     #[test]
