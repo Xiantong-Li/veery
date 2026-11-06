@@ -365,10 +365,14 @@ fn ensure_run() -> Result<(), String> {
 
 fn ensure_task() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|error| error.to_string())?;
+    let path = exe.to_string_lossy();
     // 先删掉可能写坏的旧任务（错误加引号时，登录会经 cmd 闪黑框）。
     let _ = remove_task();
-    // 用 XML 导入，避免 /TR 在不同系统语言、路径空格下被拆坏或包成 cmd。
-    create_task_from_xml(&exe)?;
+    // 普通用户创建登录任务必须用 /TR，不要用 /XML：XML 导入在多数机器上要管理员，会直接「拒绝访问」。
+    // /TR 交给 Command 单独传参，由系统负责引号；这里再人工包一层会变成 cmd 命令行，开机闪黑框。
+    // /SC ONLOGON /RL LIMITED：当前用户登录后以普通权限启动。
+    // /IT 在部分环境不可用，失败后再退回不带 /IT 的同款任务，覆盖常见 Win10/11 家庭版与企业版。
+    create_logon_task(path.as_ref())?;
     if !task_enabled() {
         let _ = remove_task();
         return Err("优先加速启动没有写入成功，系统拒绝了这项修改".to_string());
@@ -380,68 +384,41 @@ fn ensure_task() -> Result<(), String> {
     Ok(())
 }
 
-fn create_task_from_xml(exe: &Path) -> Result<(), String> {
-    let xml = task_definition_xml(exe);
-    let file = std::env::temp_dir().join(format!("veery-startup-{}.xml", std::process::id()));
-    write_utf16_le_file(&file, &xml)?;
-    let xml_path = file.to_string_lossy().into_owned();
-    let result = schtasks(&["/Create", "/TN", TASK_NAME, "/XML", &xml_path, "/F"]);
-    let _ = std::fs::remove_file(&file);
-    result
-}
-
-fn task_definition_xml(exe: &Path) -> String {
-    let command = xml_escape(&exe.to_string_lossy());
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-16"?>
-<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <Triggers>
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-    </LogonTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{command}</Command>
-    </Exec>
-  </Actions>
-</Task>
-"#
-    )
-}
-
-fn write_utf16_le_file(path: &Path, text: &str) -> Result<(), String> {
-    let mut bytes = Vec::with_capacity(2 + text.len() * 2);
-    bytes.extend_from_slice(&[0xFF, 0xFE]);
-    for unit in text.encode_utf16() {
-        bytes.extend_from_slice(&unit.to_le_bytes());
+fn create_logon_task(exe_path: &str) -> Result<(), String> {
+    let create = |interactive: bool| -> Result<(), String> {
+        let mut args = vec![
+            "/Create",
+            "/TN",
+            TASK_NAME,
+            "/TR",
+            exe_path,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "LIMITED",
+        ];
+        if interactive {
+            args.push("/IT");
+        }
+        args.push("/F");
+        schtasks(&args)
+    };
+    match create(true) {
+        Ok(()) => Ok(()),
+        Err(with_it) => match create(false) {
+            Ok(()) => Ok(()),
+            Err(without_it) => Err(prefer_access_hint(with_it, without_it)),
+        },
     }
-    std::fs::write(path, bytes).map_err(|error| format!("优先加速启动临时文件写入失败：{error}"))
 }
 
-fn xml_escape(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+fn prefer_access_hint(first: String, second: String) -> String {
+    let joined = format!("{first}；{second}");
+    if joined.contains("拒绝访问") || joined.to_ascii_lowercase().contains("access is denied") {
+        "优先加速启动修改失败：系统拒绝写入计划任务。请确认当前 Windows 账号允许创建任务计划，或暂时关闭杀软对 schtasks 的拦截。".to_string()
+    } else {
+        second
+    }
 }
 
 fn xml_unescape(value: &str) -> String {
@@ -656,9 +633,16 @@ mod tests {
             extract_xml_command("<COMMAND>D:\\a&amp;b\\veery.exe</COMMAND>").as_deref(),
             Some(r"D:\a&b\veery.exe")
         );
-        let definition = task_definition_xml(Path::new(r"D:\App Gallery\veery.exe"));
-        assert!(definition.contains(r"<Command>D:\App Gallery\veery.exe</Command>"));
-        assert!(!definition.contains("/TR"));
+    }
+
+    #[test]
+    fn access_denied_gets_plain_chinese_hint() {
+        let hint = prefer_access_hint(
+            "优先加速启动修改失败：错误: 拒绝访问。".into(),
+            "优先加速启动修改失败：ERROR: Access is denied.".into(),
+        );
+        assert!(hint.contains("计划任务"), "{hint}");
+        assert!(!hint.contains('\u{FFFD}'), "{hint}");
     }
 
     #[test]
