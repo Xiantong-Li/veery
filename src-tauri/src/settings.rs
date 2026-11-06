@@ -12,6 +12,11 @@ const RUN_KEY_CMD: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_NAME: &str = "Veery";
 const SERIALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize";
 const STARTUP_DELAY_VALUE: &str = "StartupDelayInMSec";
+const WAIT_FOR_IDLE_VALUE: &str = "WaitForIdleState";
+const STARTUP_APPROVED_KEY: &str =
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
+/// 任务管理器「启动应用」启用态：首字节 0x02。禁用为 0x03。
+const STARTUP_APPROVED_ENABLED: [u8; 12] = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 /// 0.2.6/0.2.7 用过的登录计划任务；引号写坏时会经 cmd 拉起并弹黑框。只删不建。
 const LEGACY_TASK_NAME: &str = "VeeryStartup";
 pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
@@ -309,7 +314,7 @@ pub fn save_fast_autostart(app: &AppHandle, enabled: bool) -> Result<(), String>
 pub fn set_autostart(enabled: bool) -> Result<(), String> {
     if !enabled {
         let _ = remove_run();
-        if run_enabled() {
+        if run_value_present() {
             return Err("开机启动没有写入成功，系统拒绝了这项修改".to_string());
         }
         return Ok(());
@@ -329,10 +334,8 @@ pub fn apply_fast_autostart(fast: bool) -> Result<(), String> {
             return Err("优先加速启动没有写入成功，系统拒绝了这项修改".to_string());
         }
     } else {
+        // clear_startup_delay 已校验两项都删掉。
         clear_startup_delay()?;
-        if startup_delay_disabled() {
-            return Err("旧的优先启动项没有清掉，请再关一次优先加速启动".to_string());
-        }
     }
     Ok(())
 }
@@ -349,17 +352,34 @@ pub fn spawn_legacy_task_cleanup() {
 }
 
 fn run_enabled() -> bool {
+    run_value_present() && !startup_approved_disabled()
+}
+
+fn run_value_present() -> bool {
     run_key()
         .ok()
         .and_then(|key| key.get_value::<String, _>(RUN_NAME).ok())
         .is_some()
 }
 
+/// Win10 靠 StartupDelayInMSec；Win11 还会等空闲，需 WaitForIdleState=0。两项都为 0 才算开着。
 fn startup_delay_disabled() -> bool {
-    serialize_key()
-        .ok()
-        .and_then(|key| key.get_value::<u32, _>(STARTUP_DELAY_VALUE).ok())
-        .is_some_and(|value| value == 0)
+    let Ok(key) = serialize_key() else {
+        return false;
+    };
+    let delay = key.get_value::<u32, _>(STARTUP_DELAY_VALUE).ok() == Some(0);
+    let wait = key.get_value::<u32, _>(WAIT_FOR_IDLE_VALUE).ok() == Some(0);
+    delay && wait
+}
+
+fn startup_approved_disabled() -> bool {
+    let Ok(key) = startup_approved_key(false) else {
+        return false;
+    };
+    match key.get_raw_value(RUN_NAME) {
+        Ok(value) => value.bytes.first().copied() == Some(0x03),
+        Err(_) => false,
+    }
 }
 
 fn ensure_run() -> Result<(), String> {
@@ -384,6 +404,12 @@ fn ensure_run() -> Result<(), String> {
     if !run_command_is_safe(&written) {
         let _ = remove_run();
         return Err("开机启动写入后校验失败，已撤回".to_string());
+    }
+    // 同步任务管理器启动项为启用，避免用户曾禁用后 Run 在但实际不启。
+    ensure_startup_approved_enabled()?;
+    if startup_approved_disabled() {
+        let _ = remove_run();
+        return Err("开机启动没有写入成功，系统拒绝了这项修改".to_string());
     }
     Ok(())
 }
@@ -421,6 +447,8 @@ fn run_command_is_safe(command: &str) -> bool {
 fn ensure_startup_delay_disabled() -> Result<(), String> {
     let key = serialize_key()?;
     key.set_value(STARTUP_DELAY_VALUE, &0u32)
+        .map_err(|error| format!("优先加速启动修改失败：{error}"))?;
+    key.set_value(WAIT_FOR_IDLE_VALUE, &0u32)
         .map_err(|error| format!("优先加速启动修改失败：{error}"))
 }
 
@@ -428,18 +456,51 @@ fn clear_startup_delay() -> Result<(), String> {
     let Ok(key) = serialize_key() else {
         return Ok(());
     };
-    match key.delete_value(STARTUP_DELAY_VALUE) {
+    delete_reg_value(&key, STARTUP_DELAY_VALUE)?;
+    delete_reg_value(&key, WAIT_FOR_IDLE_VALUE)?;
+    if startup_delay_disabled() {
+        return Err("旧的优先启动项没有清掉，请再关一次优先加速启动".to_string());
+    }
+    Ok(())
+}
+
+fn delete_reg_value(key: &RegKey, name: &str) -> Result<(), String> {
+    match key.delete_value(name) {
         Ok(()) => Ok(()),
-        Err(_) if !startup_delay_disabled() => Ok(()),
+        Err(_) if key.get_value::<u32, _>(name).is_err() => Ok(()),
         Err(error) => Err(format!("优先加速启动修改失败：{error}")),
     }
 }
 
 fn remove_run() -> Result<(), String> {
+    let _ = clear_startup_approved();
     match reg(&["delete", RUN_KEY_CMD, "/v", RUN_NAME, "/f"]) {
         Ok(()) => Ok(()),
-        Err(_) if !run_enabled() => Ok(()),
+        Err(_) if !run_value_present() => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+fn ensure_startup_approved_enabled() -> Result<(), String> {
+    let key = startup_approved_key(true)?;
+    key.set_raw_value(
+        RUN_NAME,
+        &winreg::RegValue {
+            bytes: STARTUP_APPROVED_ENABLED.to_vec(),
+            vtype: winreg::enums::RegType::REG_BINARY,
+        },
+    )
+    .map_err(|error| format!("开机启动修改失败：{error}"))
+}
+
+fn clear_startup_approved() -> Result<(), String> {
+    let Ok(key) = startup_approved_key(false) else {
+        return Ok(());
+    };
+    match key.delete_value(RUN_NAME) {
+        Ok(()) => Ok(()),
+        Err(_) if key.get_raw_value(RUN_NAME).is_err() => Ok(()),
+        Err(error) => Err(format!("开机启动修改失败：{error}")),
     }
 }
 
@@ -448,6 +509,18 @@ fn serialize_key() -> Result<RegKey, String> {
     hkcu.create_subkey(SERIALIZE_KEY)
         .map(|(key, _)| key)
         .map_err(|error| error.to_string())
+}
+
+fn startup_approved_key(create: bool) -> Result<RegKey, String> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if create {
+        hkcu.create_subkey(STARTUP_APPROVED_KEY)
+            .map(|(key, _)| key)
+            .map_err(|error| error.to_string())
+    } else {
+        hkcu.open_subkey_with_flags(STARTUP_APPROVED_KEY, KEY_READ | KEY_WRITE)
+            .map_err(|error| error.to_string())
+    }
 }
 
 fn reg(args: &[&str]) -> Result<(), String> {
