@@ -5,7 +5,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Windows" />
-  <img src="https://img.shields.io/badge/version-0.2.4-lightgrey" alt="version 0.2.4" />
+  <img src="https://img.shields.io/badge/version-0.2.5-lightgrey" alt="version 0.2.5" />
   <a href="https://github.com/Xiantong-Li/veery"><img src="https://img.shields.io/badge/GitHub-181717?logo=github&amp;logoColor=white" alt="GitHub" /></a>
   <a href="https://gitee.com/li-xiantong/veery"><img src="https://img.shields.io/badge/Gitee-C71D23?logo=gitee&amp;logoColor=white" alt="Gitee" /></a>
 </p>
@@ -31,10 +31,12 @@ Veery（维里）是一个常驻系统托盘的 Windows 启动器。按下全局
 
 - 启动后留在托盘里，不占用任务栏
 - 默认使用 `Alt + 空格` 呼出或隐藏搜索框，快捷键可以在设置里修改
-- 按程序全称、拼音和首字母匹配开始菜单中的快捷方式
+- 按程序全称、拼音和首字母匹配开始菜单里的程序（含计算器、终端等系统应用）
+- 同一搜索词下，常用过的程序会排得更靠前
 - 鼠标悬停选中结果，点击或按回车启动
 - 右键结果可以打开、以管理员身份运行，或打开所在文件夹
-- 支持开机启动
+- 支持开机启动，可选优先加速启动
+- 搜索框右侧齿轮打开设置（语言、主题、开机启动、快捷键、搜索提示文字等）
 
 ## 使用
 
@@ -47,9 +49,10 @@ Veery（维里）是一个常驻系统托盘的 Windows 启动器。按下全局
 | 鼠标悬停 | 选中该行 |
 | 回车，或点击结果 | 启动程序 |
 | 右键结果 | 打开、以管理员身份运行、打开所在文件夹 |
+| 搜索框右侧齿轮 | 展开或收起设置 |
 | `Esc`，或点击窗口外 | 关闭搜索框 |
 
-右键托盘图标可以打开设置或退出。设置里可以开关开机启动，并录入新的全局快捷键。录入时需要带上 `Ctrl`、`Alt` 或 `Shift`。
+右键托盘图标也可以打开设置或退出。设置里可开关开机启动与优先加速，并录入新的全局快捷键（需带上 `Ctrl`、`Alt` 或 `Shift`）。
 
 ## 从源码构建
 
