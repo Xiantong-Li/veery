@@ -28,11 +28,14 @@ const query = ref("");
 const results = ref<Hit[]>([]);
 const answered = ref("");
 const indexing = ref(false);
+const searching = ref(false);
 const selected = ref(0);
 const error = ref("");
 const settingsOpen = ref(false);
 const settingsMounted = ref(false);
+const resumeSettings = ref(false);
 const recording = ref(false);
+let suppressSettingsFocusClose = false;
 const inputEl = ref<HTMLInputElement | null>(null);
 const sheetEl = ref<HTMLElement | null>(null);
 const menuEl = ref<HTMLElement | null>(null);
@@ -46,6 +49,7 @@ const searchOpen = computed(
     !settingsOpen.value &&
     (Boolean(error.value) ||
       indexing.value ||
+      searching.value ||
       (query.value.trim() !== "" && (results.value.length > 0 || settled.value))),
 );
 const drawerOpen = computed(() => settingsOpen.value || searchOpen.value);
@@ -53,7 +57,7 @@ const drawerOpen = computed(() => settingsOpen.value || searchOpen.value);
 const DRAWER_MS = 280;
 let searchTimer = 0;
 let frameTimer = 0;
-let settingsUnmountTimer = 0;
+let settingsWarmTimer = 0;
 let resultsClearTimer = 0;
 
 const frameMode = computed(() => {
@@ -85,6 +89,7 @@ function clearSearch(immediate = false) {
   query.value = "";
   answered.value = "";
   indexing.value = false;
+  searching.value = false;
   error.value = "";
   menu.value = null;
   if (immediate || results.value.length === 0) {
@@ -98,22 +103,26 @@ function clearSearch(immediate = false) {
   }, DRAWER_MS);
 }
 
-function closeSettings() {
+function closeSettings(options: { keepResume?: boolean } = {}) {
   if (recording.value) {
     void panelEl.value?.stopRecording();
   }
+  if (!options.keepResume) {
+    resumeSettings.value = false;
+  }
   settingsOpen.value = false;
   recording.value = false;
-  window.clearTimeout(settingsUnmountTimer);
-  settingsUnmountTimer = window.setTimeout(() => {
-    settingsMounted.value = false;
-  }, DRAWER_MS);
+  // 设置面板保持挂载，下次展开不再重新创建整棵树。
+}
+
+function warmSettingsPanel() {
+  if (settingsMounted.value) return;
+  settingsMounted.value = true;
 }
 
 function openSettingsPanel() {
-  window.clearTimeout(settingsUnmountTimer);
   clearSearch(true);
-  settingsMounted.value = true;
+  warmSettingsPanel();
   settingsOpen.value = true;
   recording.value = false;
 }
@@ -121,11 +130,25 @@ function openSettingsPanel() {
 function toggleSettings() {
   menu.value = null;
   if (settingsOpen.value) {
+    // 关设置后再聚焦输入框时，忽略这次 focus，避免又 toggle 开回去。
+    suppressSettingsFocusClose = true;
     closeSettings();
-    void focusInput();
+    void focusInput().finally(() => {
+      window.setTimeout(() => {
+        suppressSettingsFocusClose = false;
+      }, 0);
+    });
     return;
   }
+  resumeSettings.value = false;
   openSettingsPanel();
+}
+
+function onInputFocus() {
+  if (suppressSettingsFocusClose) return;
+  if (settingsOpen.value) {
+    closeSettings();
+  }
 }
 
 function onQueryInput(event: Event) {
@@ -145,6 +168,7 @@ function scheduleRefresh() {
     request += 1;
     answered.value = "";
     indexing.value = false;
+    searching.value = false;
     error.value = "";
     window.clearTimeout(resultsClearTimer);
     if (results.value.length === 0) {
@@ -159,7 +183,11 @@ function scheduleRefresh() {
     return;
   }
   window.clearTimeout(resultsClearTimer);
-  if (text === answered.value && !error.value && !indexing.value) return;
+  if (text === answered.value && !error.value && !indexing.value && !searching.value) return;
+  // 还没有可展示的结果时先进入搜索中，抽屉展开并给出反馈，避免干等像卡住。
+  if (results.value.length === 0) {
+    searching.value = true;
+  }
   searchTimer = window.setTimeout(() => {
     void refresh();
   }, 40);
@@ -168,21 +196,33 @@ function scheduleRefresh() {
 async function refresh() {
   const current = ++request;
   const text = query.value;
-  if (!text.trim() || settingsOpen.value) return;
+  if (!text.trim() || settingsOpen.value) {
+    searching.value = false;
+    return;
+  }
+  if (results.value.length === 0) {
+    searching.value = true;
+  }
   try {
     const body = await invoke<SearchBody>("search", { query: text });
     if (current !== request || settingsOpen.value) return;
     indexing.value = !body.ready;
     error.value = "";
-    if (!body.ready) return;
+    if (!body.ready) {
+      // 索引未好时继续显示读取提示，不算搜索结束。
+      searching.value = false;
+      return;
+    }
     results.value = body.hits;
     answered.value = text;
+    searching.value = false;
     if (selected.value >= results.value.length) {
       selected.value = 0;
     }
   } catch (cause) {
     if (current !== request) return;
     indexing.value = false;
+    searching.value = false;
     error.value = String(cause);
   }
 }
@@ -191,7 +231,11 @@ async function act(command: "launch" | "launch_admin" | "reveal", id: number) {
   menu.value = null;
   error.value = "";
   try {
-    await invoke(command, { id });
+    if (command === "reveal") {
+      await invoke(command, { id });
+    } else {
+      await invoke(command, { id, query: query.value });
+    }
     query.value = "";
   } catch (cause) {
     error.value = String(cause);
@@ -292,15 +336,29 @@ async function focusInput() {
   inputEl.value?.select();
 }
 
-function resetChrome() {
-  window.clearTimeout(settingsUnmountTimer);
+function resetChrome(options: { preserveResume?: boolean } = {}) {
   window.clearTimeout(resultsClearTimer);
+  if (!options.preserveResume) {
+    resumeSettings.value = false;
+  }
   settingsOpen.value = false;
-  settingsMounted.value = false;
   recording.value = false;
   clearSearch(true);
   window.clearTimeout(frameTimer);
   void invoke("set_launcher_frame", { mode: "idle" }).catch(() => undefined);
+}
+
+function restoreChrome() {
+  window.clearTimeout(resultsClearTimer);
+  clearSearch(true);
+  menu.value = null;
+  recording.value = false;
+  if (resumeSettings.value) {
+    warmSettingsPanel();
+    settingsOpen.value = true;
+  } else {
+    settingsOpen.value = false;
+  }
 }
 
 const stops: UnlistenFn[] = [];
@@ -311,17 +369,20 @@ onMounted(async () => {
   try {
     stops.push(
       await listen("shown", async () => {
-        resetChrome();
+        restoreChrome();
         await focusInput();
       }),
     );
     stops.push(
       await listen("hidden", () => {
-        resetChrome();
+        // 设置开着时点到桌面：先记住，下次唤出仍进设置。
+        resumeSettings.value = settingsOpen.value;
+        resetChrome({ preserveResume: true });
       }),
     );
     stops.push(
       await listen("open-settings", async () => {
+        resumeSettings.value = false;
         openSettingsPanel();
         await nextTick();
       }),
@@ -329,6 +390,7 @@ onMounted(async () => {
     stops.push(
       await listen("catalog-ready", () => {
         indexing.value = false;
+        searching.value = false;
         results.value = [];
         answered.value = "";
         selected.value = 0;
@@ -348,12 +410,16 @@ onMounted(async () => {
   }
   stopThemeWatch = watchSystemTheme(() => theme.value);
   await focusInput();
+  // 空闲时预挂载设置面板，第一次点齿轮就只做展开动画。
+  settingsWarmTimer = window.setTimeout(() => {
+    warmSettingsPanel();
+  }, 600);
 });
 
 onUnmounted(() => {
   window.clearTimeout(searchTimer);
   window.clearTimeout(frameTimer);
-  window.clearTimeout(settingsUnmountTimer);
+  window.clearTimeout(settingsWarmTimer);
   window.clearTimeout(resultsClearTimer);
   window.removeEventListener("pointerdown", onPointerDown);
   for (const stop of stops) stop();
@@ -374,7 +440,7 @@ onUnmounted(() => {
           :readonly="settingsOpen"
           @input="onQueryInput"
           @keydown="onKeydown"
-          @focus="settingsOpen && toggleSettings()"
+          @focus="onInputFocus"
         />
         <button
           type="button"
@@ -396,16 +462,18 @@ onUnmounted(() => {
         <div>
           <SettingsPanel
             v-if="settingsMounted"
+            v-show="settingsOpen"
             ref="panelEl"
             :language="language"
             :theme="theme"
             :hint="hint"
+            :active="settingsOpen"
             @language-change="language = $event"
             @theme-change="theme = $event"
             @hint-change="hint = $event"
             @recording-change="recording = $event"
           />
-          <template v-else-if="!settingsMounted">
+          <template v-if="!settingsOpen">
             <p v-if="error" class="note error">{{ error }}</p>
             <ul v-else-if="results.length" class="results">
               <li v-for="(item, index) in results" :key="item.id">
@@ -424,6 +492,7 @@ onUnmounted(() => {
               </li>
             </ul>
             <p v-else-if="indexing" class="note">{{ t.indexing }}</p>
+            <p v-else-if="searching" class="note">{{ t.searching }}</p>
             <p v-else-if="settled" class="note">{{ t.empty }}</p>
           </template>
         </div>

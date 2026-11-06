@@ -22,6 +22,7 @@ const props = defineProps<{
   language: Language;
   theme: ThemeChoice;
   hint: string;
+  active?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -77,6 +78,20 @@ watch(
   () => props.language,
   () => {
     void nextTick(moveSelection);
+  },
+);
+
+watch(
+  () => props.active,
+  (active) => {
+    if (!active) return;
+    void nextTick(() => {
+      moveSelection();
+      requestAnimationFrame(() => {
+        switchReady.value = true;
+        selectionReady.value = true;
+      });
+    });
   },
 );
 
