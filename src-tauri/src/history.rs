@@ -69,28 +69,31 @@ fn store(app: &AppHandle, saved: &Saved) -> Result<(), String> {
     std::fs::rename(&temp, &path).map_err(|error| error.to_string())
 }
 
-/// 同一查询下选过越多次，加分越高，用来压过同分的字母序。
-pub fn boost_for(app: &AppHandle, query: &str, path: &Path) -> (i32, u64) {
+/// 同一查询下的启动偏好：path → (加分, 最近使用时间)。
+/// 每次搜索只读一遍历史文件，评分循环里不再碰磁盘。
+pub fn boosts(app: &AppHandle, query: &str) -> HashMap<String, (i32, u64)> {
     let key = fold_query(query);
     if key.is_empty() {
-        return (0, 0);
+        return HashMap::new();
     }
-    let path_key = path.to_string_lossy();
     let saved = load(app);
     let Some(entries) = saved.queries.get(&key) else {
-        return (0, 0);
+        return HashMap::new();
     };
-    let Some(entry) = entries.iter().find(|entry| entry.path == path_key) else {
-        return (0, 0);
-    };
-    let boost = match entry.count {
+    entries
+        .iter()
+        .map(|entry| (entry.path.clone(), (tier(entry.count), entry.last)))
+        .collect()
+}
+
+fn tier(count: u32) -> i32 {
+    match count {
         0 => 0,
         1 => 150,
         2 => 250,
         3 => 320,
         _ => 400,
-    };
-    (boost, entry.last)
+    }
 }
 
 pub fn record(app: &AppHandle, query: &str, path: &Path) -> Result<(), String> {
@@ -140,5 +143,14 @@ mod tests {
     fn fold_query_trims_and_lowers() {
         assert_eq!(fold_query("  G  "), "g");
         assert_eq!(fold_query("Foo Bar"), "foo bar");
+    }
+
+    #[test]
+    fn boost_tiers_rise_with_usage() {
+        assert_eq!(tier(0), 0);
+        assert_eq!(tier(1), 150);
+        assert_eq!(tier(2), 250);
+        assert_eq!(tier(3), 320);
+        assert_eq!(tier(9), 400);
     }
 }

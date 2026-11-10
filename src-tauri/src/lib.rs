@@ -4,7 +4,7 @@ mod settings;
 mod update;
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -448,9 +448,17 @@ fn search(app: AppHandle, state: tauri::State<AppState>, query: String) -> Searc
             hits: Vec::new(),
         };
     }
+    // 历史只读一次；不要放进评分循环里逐条读盘。
+    let boosts = history::boosts(&app, &query);
     let mut hits = {
         let apps = state.index.lock().unwrap_or_else(|error| error.into_inner());
-        catalog::search_with_boost(&apps, &query, 8, |q, path| history::boost_for(&app, q, path))
+        let boost = |_query: &str, path: &Path| {
+            boosts
+                .get(path.to_string_lossy().as_ref())
+                .copied()
+                .unwrap_or((0, 0))
+        };
+        catalog::search_with_boost(&apps, &query, 8, boost)
     };
     attach_icons(&state, &mut hits);
     SearchResponse { ready: true, hits }
