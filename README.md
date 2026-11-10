@@ -5,7 +5,7 @@
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT License" /></a>
   <img src="https://img.shields.io/badge/platform-Windows-0078D6" alt="Windows" />
-  <img src="https://img.shields.io/badge/version-0.2.9-lightgrey" alt="version 0.2.9" />
+  <img src="https://img.shields.io/badge/version-0.3.0-lightgrey" alt="version 0.3.0" />
   <a href="https://github.com/Xiantong-Li/veery"><img src="https://img.shields.io/badge/GitHub-181717?logo=github&logoColor=white" alt="GitHub" /></a>
   <a href="https://gitee.com/li-xiantong/veery"><img src="https://img.shields.io/badge/Gitee-C71D23?logo=gitee&logoColor=white" alt="Gitee" /></a>
 </p>
@@ -37,8 +37,9 @@ Veery（维里）是轻量的 Windows 托盘启动器。按下全局快捷键后
 - 同一搜索词下，常用程序排得更靠前
 - 悬停选中结果；点击或回车启动
 - 右键结果：打开、以管理员身份运行、打开所在文件夹
+- 可选文件搜索：在桌面、文档和下载中按类型查找文件，结果与程序一起展示（默认关闭）
 - 可选开机启动；可选「优先加速」，减少登录后系统对自启项的延迟（对当前账户下全部开机项生效，在较新的 Windows 上更明显）
-- 搜索框右侧齿轮打开设置：语言、主题、开机启动、优先加速、快捷键、搜索提示文字等
+- 搜索框右侧齿轮打开设置：语言、主题、开机启动、优先加速、文件搜索、快捷键、搜索提示文字等
 
 ## 使用
 
@@ -47,7 +48,7 @@ Veery（维里）是轻量的 Windows 托盘启动器。按下全局快捷键后
 | 操作 | 结果 |
 | --- | --- |
 | 全局快捷键（默认 `Alt + 空格`） | 呼出或隐藏搜索框 |
-| 输入文字 | 匹配开始菜单程序 |
+| 输入文字 | 匹配开始菜单程序；开启文件搜索后也会匹配文件 |
 | 鼠标悬停 | 选中该行 |
 | 回车，或点击结果 | 启动程序 |
 | 右键结果 | 打开、以管理员身份运行、打开所在文件夹 |
