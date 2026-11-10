@@ -1,6 +1,9 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use pinyin::ToPinyin;
 use serde::Serialize;
@@ -56,6 +59,84 @@ pub fn scan() -> Result<Vec<AppEntry>, String> {
 
 pub fn search(apps: &[AppEntry], query: &str, limit: usize) -> Vec<SearchHit> {
     search_with_boost(apps, query, limit, |_, _| (0, 0))
+}
+
+/// 只列开始菜单里快捷方式的路径、修改时间和大小，不解快捷方式、不取图标。
+/// 唤出时拿它和上次的值比，几毫秒就能判断有没有新装或卸载的程序。
+pub fn fingerprint() -> Option<u64> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    let mut saw_dir = false;
+    for dir in start_menu_dirs() {
+        if !dir.exists() {
+            continue;
+        }
+        saw_dir = true;
+        collect_links(&dir, &mut entries, &mut seen, 0);
+    }
+    if !saw_dir {
+        return None;
+    }
+    Some(fingerprint_of(entries))
+}
+
+fn collect_links(
+    dir: &Path,
+    into: &mut Vec<(String, u64, u64)>,
+    seen: &mut HashSet<PathBuf>,
+    depth: u8,
+) {
+    if depth > 12 {
+        return;
+    }
+    let identity = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    if !seen.insert(identity) {
+        return;
+    }
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            collect_links(&path, into, seen, depth + 1);
+            continue;
+        }
+        let is_link = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"));
+        if !is_link {
+            continue;
+        }
+        // Windows 上 DirEntry::metadata 直接复用目录枚举的数据，不额外读盘。
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or(0);
+        into.push((path.to_string_lossy().to_string(), modified, meta.len()));
+    }
+}
+
+fn fingerprint_of(mut entries: Vec<(String, u64, u64)>) -> u64 {
+    entries.sort();
+    let mut hasher = DefaultHasher::new();
+    for (path, modified, len) in entries {
+        path.hash(&mut hasher);
+        modified.hash(&mut hasher);
+        len.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// `boost` 返回 (加分, 最近使用时间)。同一查询下选过的程序会排得更靠前。
@@ -963,6 +1044,31 @@ mod tests {
             initials,
             path: PathBuf::new(),
         }
+    }
+
+    #[test]
+    fn fingerprint_tracks_shortcut_changes() {
+        let base = vec![
+            (r"C:\menu\a.lnk".to_string(), 10, 100),
+            (r"C:\menu\b.lnk".to_string(), 20, 200),
+        ];
+        let reordered = vec![base[1].clone(), base[0].clone()];
+        assert_eq!(fingerprint_of(base.clone()), fingerprint_of(reordered));
+
+        let mut added = base.clone();
+        added.push((r"C:\menu\c.lnk".to_string(), 30, 300));
+        assert_ne!(fingerprint_of(base.clone()), fingerprint_of(added));
+
+        let mut touched = base.clone();
+        touched[0].1 = 11;
+        assert_ne!(fingerprint_of(base), fingerprint_of(touched));
+    }
+
+    #[test]
+    fn start_menu_fingerprint_is_stable() {
+        let first = fingerprint().unwrap_or_else(|| panic!("没有指纹"));
+        let second = fingerprint().unwrap_or_else(|| panic!("没有指纹"));
+        assert_eq!(first, second);
     }
 
     #[test]

@@ -50,6 +50,9 @@ struct TrayItems {
 struct AppState {
     index: Mutex<Vec<catalog::AppEntry>>,
     index_ready: AtomicBool,
+    index_scanning: AtomicBool,
+    index_checking: AtomicBool,
+    index_fingerprint: Mutex<Option<u64>>,
     icons: Mutex<IconCache>,
     files: FileState,
     shown_at: Mutex<Instant>,
@@ -321,6 +324,8 @@ fn show_launcher(app: &AppHandle) {
             spawn_file_scan(app);
         }
     }
+    // 新装程序不靠定时重扫：唤出时比一下快捷方式指纹，变了才后台重扫。
+    spawn_catalog_check(app);
     set_memory_level(&window, false);
     // 唤出时只显示搜索条。列表区域留到真正展开时再加，避免空窗口被截得很高。
     set_launcher_size(&window, LAUNCHER_IDLE_HEIGHT);
@@ -766,6 +771,69 @@ fn reload_catalog(app: &AppHandle) {
     warm_icons(app);
 }
 
+/// 唤出时比对指纹：只列快捷方式，几毫秒；变了再触发全量重扫。
+fn spawn_catalog_check(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    // 连按快捷键时只留一个比对线程。
+    if state.index_checking.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("veery-index-check".into())
+        .spawn(move || {
+            let current = catalog::fingerprint();
+            let changed = app
+                .try_state::<AppState>()
+                .map(|state| {
+                    let last = *state
+                        .index_fingerprint
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    // 指纹还没建立（启动扫描还没完）时不重扫，启动扫描本身会覆盖。
+                    matches!((current, last), (Some(current), Some(last)) if current != last)
+                })
+                .unwrap_or(false);
+            if let Some(state) = app.try_state::<AppState>() {
+                state.index_checking.store(false, Ordering::Release);
+            }
+            if changed {
+                spawn_catalog_scan(&app);
+            }
+        });
+    if spawned.is_err() {
+        state.index_checking.store(false, Ordering::Release);
+    }
+}
+
+fn spawn_catalog_scan(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    if state.index_scanning.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("veery-index".into())
+        .spawn(move || {
+            // 先记指纹再扫：扫描期间新增的快捷方式会让下次唤出再补一轮。
+            let fingerprint = catalog::fingerprint();
+            reload_catalog(&app);
+            if let Some(state) = app.try_state::<AppState>() {
+                if let Ok(mut last) = state.index_fingerprint.lock() {
+                    *last = fingerprint;
+                }
+                state.index_scanning.store(false, Ordering::Release);
+            }
+        });
+    if spawned.is_err() {
+        state.index_scanning.store(false, Ordering::Release);
+    }
+}
+
 fn warm_icons(app: &AppHandle) {
     let app = app.clone();
     std::thread::Builder::new()
@@ -800,11 +868,7 @@ fn warm_icons(app: &AppHandle) {
 
 #[tauri::command]
 fn refresh_index(app: AppHandle) {
-    let app = app.clone();
-    std::thread::Builder::new()
-        .name("veery-index".into())
-        .spawn(move || reload_catalog(&app))
-        .ok();
+    spawn_catalog_scan(&app);
 }
 
 fn spawn_file_scan(app: &AppHandle) {
@@ -1100,6 +1164,9 @@ pub fn run() {
             app.manage(AppState {
                 index: Mutex::new(Vec::new()),
                 index_ready: AtomicBool::new(false),
+                index_scanning: AtomicBool::new(false),
+                index_checking: AtomicBool::new(false),
+                index_fingerprint: Mutex::new(None),
                 icons: Mutex::new(IconCache {
                     ready: HashMap::new(),
                 }),
@@ -1121,11 +1188,7 @@ pub fn run() {
                 shortcut: Mutex::new(shortcut.clone()),
                 tray: Mutex::new(None),
             });
-            let handle = app.handle().clone();
-            std::thread::Builder::new()
-                .name("veery-index".into())
-                .spawn(move || reload_catalog(&handle))
-                .ok();
+            spawn_catalog_scan(app.handle());
             if prefs.file_search {
                 spawn_file_scan(app.handle());
             }
