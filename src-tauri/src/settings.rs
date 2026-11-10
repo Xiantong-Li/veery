@@ -9,7 +9,7 @@ use winreg::RegKey;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_KEY_CMD: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
-/// 测试进程不能覆盖已安装程序的 Run 项，否则开发者本机的开机启动会被测试清掉。
+/// 测试使用独立的值名，避免改动已安装实例的开机启动项。
 #[cfg(not(test))]
 const RUN_NAME: &str = "Veery";
 #[cfg(test)]
@@ -21,7 +21,7 @@ const STARTUP_APPROVED_KEY: &str =
     r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run";
 /// 任务管理器「启动应用」启用态：首字节 0x02。禁用为 0x03。
 const STARTUP_APPROVED_ENABLED: [u8; 12] = [0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-/// 0.2.6/0.2.7 用过的登录计划任务；引号写坏时会经 cmd 拉起并弹黑框。只删不建。
+/// 旧版用过的登录计划任务，引号写坏时会经 cmd 拉起并弹黑框。只清理，不再创建。
 const LEGACY_TASK_NAME: &str = "VeeryStartup";
 pub const DEFAULT_SHORTCUT: &str = "Alt+Space";
 
@@ -673,14 +673,14 @@ mod tests {
 
     #[test]
     fn tests_use_a_separate_autostart_entry() {
-        // 值名必须和生产版不同，否则测试会改掉本机已安装 Veery 的开机启动。
+        // 值名与生产版不同，测试不会改动真实的开机启动项。
         assert_ne!(RUN_NAME, "Veery");
     }
 
     #[test]
     fn autostart_round_trip() {
         let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        // 测试进程是 veery_lib-*.exe，不能写回用户原来的开机项，否则登录会启动测试二进制并可能弹控制台。
+        // 测试进程不能沿用生产值名，否则登录时会拉起测试二进制并可能弹出控制台。
         let _ = apply_fast_autostart(false);
         let _ = set_autostart(false);
         set_autostart(true).expect("enable");
@@ -723,7 +723,7 @@ mod tests {
     #[test]
     fn fast_autostart_toggle_stays_under_200ms() {
         let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        // 优先加速只能碰 HKCU 注册表；一旦又拖进外部进程，这个门槛会立刻打脸。
+        // 优先加速只读写 HKCU 注册表；一旦引入外部进程，耗时会明显超出上限。
         let _ = apply_fast_autostart(false);
         let _ = set_autostart(false);
         set_autostart(true).expect("enable run");

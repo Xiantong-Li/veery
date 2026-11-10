@@ -23,7 +23,7 @@ struct IconCache {
 }
 
 /// 文件搜索默认关闭。开启后只在桌面/文档/下载里建一份轻量列表，
-/// 打开开关或超过刷新间隔才重新扫描，搜索本身不碰磁盘。
+/// 开关打开或唤出时发现列表过期才重扫，搜索本身不碰磁盘。
 struct FileState {
     enabled: AtomicBool,
     types: Mutex<Vec<String>>,
@@ -746,7 +746,7 @@ fn store_catalog(state: &AppState, scanned: Result<Vec<catalog::AppEntry>, Strin
             icons.ready.retain(|path, _| paths.contains(path));
         }
         Err(error) => {
-            // 正式版绝不能往控制台打日志：旧开机项若经 cmd 拉起，用户会看到黑框刷索引文字。
+            // 发布版不往控制台输出：旧开机项若经 cmd 拉起，会闪出黑框。
             #[cfg(debug_assertions)]
             eprintln!("veery: 索引扫描失败，继续使用上一份索引: {error}");
             let _ = error;
