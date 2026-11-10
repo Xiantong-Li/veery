@@ -11,6 +11,9 @@ export type SettingsInfo = {
   language: string;
   theme: string;
   hint: string;
+  fileSearch: boolean;
+  fileTypes: string[];
+  fileTypeOptions: { id: string; extensions: string[] }[];
   name: string;
   version: string;
   author: string;
@@ -60,6 +63,7 @@ export function watchSystemTheme(getChoice: () => ThemeChoice) {
 
 const zh = {
   general: "常用设置",
+  files: "文件搜索",
   about: "关于",
   autostart: "开机启动",
   autostartDesc: "登录 Windows 后自动打开 Veery，并留在托盘里。",
@@ -94,9 +98,26 @@ const zh = {
   settings: "设置",
   hint: "搜索备注",
   hintDesc: "搜索框里的提示文字。留空则使用默认的「搜索」。",
+  fileSearch: "文件搜索",
+  fileSearchDesc: "同时搜索桌面、文档和下载里的文件。",
+  fileSearchHint: "开启后检索范围变大，内存占用会略有增加。",
+  fileTypes: "文件类型",
+  fileTypesDesc: "只显示勾选类型的文件，可以多选。",
+  fileSearchFirst: "请先开启文件搜索",
+  typeDocument: "文档",
+  typeImage: "图片",
+  typeMedia: "音视频",
+  typeArchive: "压缩包",
+  typeCode: "网页与脚本",
+  typeHintPrefix: "会检索：",
+  typeHintSeparator: "、",
   indexing: "正在读取开始菜单",
+  indexingFiles: "正在读取文件列表",
   searching: "搜索中…",
+  searchingFiles: "正在搜索文件…",
+  filesSection: "文件",
   empty: "没有匹配的程序",
+  emptyAll: "没有匹配的结果",
   open: "打开",
   admin: "以管理员身份运行",
   folder: "打开所在文件夹",
@@ -104,6 +125,7 @@ const zh = {
 
 const en = {
   general: "General",
+  files: "File search",
   about: "About",
   autostart: "Start with Windows",
   autostartDesc: "Open Veery when you sign in to Windows, and keep it in the tray.",
@@ -138,9 +160,26 @@ const en = {
   settings: "Settings",
   hint: "Search hint",
   hintDesc: "Placeholder text in the search box. Leave empty to use the default “Search”.",
+  fileSearch: "File search",
+  fileSearchDesc: "Also search files on your Desktop, Documents, and Downloads.",
+  fileSearchHint: "A wider search range uses a little more memory.",
+  fileTypes: "File types",
+  fileTypesDesc: "Only show the checked types. You can pick more than one.",
+  fileSearchFirst: "Turn on File search first",
+  typeDocument: "Documents",
+  typeImage: "Images",
+  typeMedia: "Audio & video",
+  typeArchive: "Archives",
+  typeCode: "Web & scripts",
+  typeHintPrefix: "Searches: ",
+  typeHintSeparator: ", ",
   indexing: "Reading the Start menu",
+  indexingFiles: "Reading file list",
   searching: "Searching…",
+  searchingFiles: "Searching files…",
+  filesSection: "Files",
   empty: "No matching programs",
+  emptyAll: "No matching results",
   open: "Open",
   admin: "Run as administrator",
   folder: "Open file location",

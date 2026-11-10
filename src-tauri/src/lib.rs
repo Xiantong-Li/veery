@@ -1,11 +1,12 @@
 mod catalog;
+mod files;
 mod history;
 mod settings;
 mod update;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,24 @@ struct IconCache {
     ready: HashMap<PathBuf, String>,
 }
 
+/// 文件搜索默认关闭。开启后只在桌面/文档/下载里建一份轻量列表，
+/// 打开开关或超过刷新间隔才重新扫描，搜索本身不碰磁盘。
+struct FileState {
+    enabled: AtomicBool,
+    types: Mutex<Vec<String>>,
+    entries: Mutex<Vec<files::FileEntry>>,
+    ready: AtomicBool,
+    scanning: AtomicBool,
+    scanned_at: Mutex<Option<Instant>>,
+    hits: Mutex<HashMap<u32, PathBuf>>,
+    icons: Mutex<HashMap<PathBuf, Option<String>>>,
+    next_id: AtomicU32,
+}
+
+const FILE_SCAN_STALE: Duration = Duration::from_secs(600);
+const FILE_HITS_CAP: usize = 3000;
+const FILE_ICONS_CAP: usize = 1024;
+
 struct TrayItems {
     show: MenuItem<Wry>,
     settings: MenuItem<Wry>,
@@ -32,6 +51,7 @@ struct AppState {
     index: Mutex<Vec<catalog::AppEntry>>,
     index_ready: AtomicBool,
     icons: Mutex<IconCache>,
+    files: FileState,
     shown_at: Mutex<Instant>,
     blur_until: Mutex<Instant>,
     settings_open: AtomicBool,
@@ -293,6 +313,14 @@ fn show_launcher(app: &AppHandle) {
         return;
     };
     mark_shown(app);
+    // 文件列表过期时在后台重扫；唤出本身不等它。
+    if let Some(state) = app.try_state::<AppState>() {
+        if state.files.enabled.load(Ordering::Acquire)
+            && (!state.files.ready.load(Ordering::Acquire) || files_stale(&state))
+        {
+            spawn_file_scan(app);
+        }
+    }
     set_memory_level(&window, false);
     // 唤出时只显示搜索条。列表区域留到真正展开时再加，避免空窗口被截得很高。
     set_launcher_size(&window, LAUNCHER_IDLE_HEIGHT);
@@ -437,6 +465,19 @@ struct SearchResponse {
     hits: Vec<catalog::SearchHit>,
 }
 
+#[derive(serde::Serialize)]
+struct FileHit {
+    id: u32,
+    name: String,
+    icon: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct FileSearchResponse {
+    ready: bool,
+    hits: Vec<FileHit>,
+}
+
 #[tauri::command]
 fn search(app: AppHandle, state: tauri::State<AppState>, query: String) -> SearchResponse {
     if let Ok(mut last) = state.last_query.lock() {
@@ -502,6 +543,189 @@ fn attach_icons(state: &AppState, hits: &mut [catalog::SearchHit]) {
             hit.icon = icons.ready.get(&hit.path).cloned();
         }
     }
+}
+
+#[tauri::command]
+fn search_files(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    query: String,
+) -> FileSearchResponse {
+    if !state.files.enabled.load(Ordering::Acquire) {
+        return FileSearchResponse {
+            ready: true,
+            hits: Vec::new(),
+        };
+    }
+    let types = {
+        let types = state
+            .files
+            .types
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        types.clone()
+    };
+    // 一个类型都没开时不扫描也不检索，直接当作没有文件结果。
+    if types.is_empty() {
+        return FileSearchResponse {
+            ready: true,
+            hits: Vec::new(),
+        };
+    }
+    if !state.files.ready.load(Ordering::Acquire) {
+        spawn_file_scan(&app);
+        return FileSearchResponse {
+            ready: false,
+            hits: Vec::new(),
+        };
+    }
+    let picked: Vec<(String, PathBuf)> = {
+        let entries = state
+            .files
+            .entries
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        files::search(&entries, &query, &types, 6)
+            .into_iter()
+            .map(|entry| (entry.name.clone(), entry.path.clone()))
+            .collect()
+    };
+    let icons = file_icons(&state, &picked);
+    let mut hits = Vec::with_capacity(picked.len());
+    let mut ids = Vec::with_capacity(picked.len());
+    {
+        let mut map = state
+            .files
+            .hits
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if map.len() > FILE_HITS_CAP {
+            map.clear();
+        }
+        for (_, path) in &picked {
+            let id = state.files.next_id.fetch_add(1, Ordering::Relaxed);
+            map.insert(id, path.clone());
+            ids.push(id);
+        }
+    }
+    for ((name, path), id) in picked.into_iter().zip(ids) {
+        let icon = icons.get(&path).cloned().flatten();
+        hits.push(FileHit { id, name, icon });
+    }
+    FileSearchResponse { ready: true, hits }
+}
+
+fn file_icons(state: &AppState, picked: &[(String, PathBuf)]) -> HashMap<PathBuf, Option<String>> {
+    let mut resolved = HashMap::new();
+    let mut missing = Vec::new();
+    {
+        let icons = state
+            .files
+            .icons
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (_, path) in picked {
+            match icons.get(path) {
+                Some(icon) => {
+                    resolved.insert(path.clone(), icon.clone());
+                }
+                None => missing.push(path.clone()),
+            }
+        }
+    }
+    if missing.is_empty() {
+        return resolved;
+    }
+    // 提取放在缓存锁外，避免一次慢图标卡住整个搜索。
+    let extracted: Vec<(PathBuf, Option<String>)> = missing
+        .into_iter()
+        .map(|path| {
+            let icon = catalog::icon_data_url(&path);
+            (path, icon)
+        })
+        .collect();
+    let mut icons = state
+        .files
+        .icons
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if icons.len() + extracted.len() > FILE_ICONS_CAP {
+        icons.clear();
+    }
+    for (path, icon) in extracted {
+        icons.insert(path.clone(), icon.clone());
+        resolved.insert(path, icon);
+    }
+    resolved
+}
+
+fn file_path(state: &AppState, id: u32) -> Result<PathBuf, String> {
+    state
+        .files
+        .hits
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(&id)
+        .cloned()
+        .ok_or_else(|| "找不到这个文件".to_string())
+}
+
+#[tauri::command]
+fn open_file(
+    window: tauri::WebviewWindow,
+    state: tauri::State<AppState>,
+    id: u32,
+) -> Result<(), String> {
+    close_before(&window, || {
+        let path = file_path(&state, id)?;
+        catalog::open_link(&path)
+    })
+}
+
+#[tauri::command]
+fn reveal_file(
+    window: tauri::WebviewWindow,
+    state: tauri::State<AppState>,
+    id: u32,
+) -> Result<(), String> {
+    close_before(&window, || {
+        let path = file_path(&state, id)?;
+        catalog::reveal(&path)
+    })
+}
+
+#[tauri::command]
+fn set_file_search(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    settings::save_file_search(&app, enabled)?;
+    state.files.enabled.store(enabled, Ordering::Release);
+    if enabled && (!state.files.ready.load(Ordering::Acquire) || files_stale(&state)) {
+        spawn_file_scan(&app);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_file_types(
+    app: AppHandle,
+    state: tauri::State<AppState>,
+    types: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let saved = settings::save_file_types(&app, &types)?;
+    if let Ok(mut current) = state.files.types.lock() {
+        *current = saved.clone();
+    }
+    // 之前一个类型都没开时不会扫描；这里补上，不必等下次唤出。
+    if !saved.is_empty()
+        && state.files.enabled.load(Ordering::Acquire)
+        && (!state.files.ready.load(Ordering::Acquire) || files_stale(&state))
+    {
+        spawn_file_scan(&app);
+    }
+    Ok(saved)
 }
 
 fn store_catalog(state: &AppState, scanned: Result<Vec<catalog::AppEntry>, String>) {
@@ -581,6 +805,67 @@ fn refresh_index(app: AppHandle) {
         .name("veery-index".into())
         .spawn(move || reload_catalog(&app))
         .ok();
+}
+
+fn spawn_file_scan(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    if !state.files.enabled.load(Ordering::Acquire) {
+        return;
+    }
+    {
+        let types = state
+            .files
+            .types
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if types.is_empty() {
+            return;
+        }
+    }
+    // 同一时间只跑一轮；开关连点时不会叠出多条扫描线程。
+    if state.files.scanning.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("veery-files".into())
+        .spawn(move || {
+            let scanned = files::scan();
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            if let Ok(entries) = scanned {
+                let mut cache = state
+                    .files
+                    .entries
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                *cache = entries;
+                if let Ok(mut scanned_at) = state.files.scanned_at.lock() {
+                    *scanned_at = Some(Instant::now());
+                }
+                state.files.ready.store(true, Ordering::Release);
+            }
+            state.files.scanning.store(false, Ordering::Release);
+            if state.files.ready.load(Ordering::Acquire) {
+                let _ = app.emit("files-ready", ());
+            }
+        });
+    if spawned.is_err() {
+        state.files.scanning.store(false, Ordering::Release);
+    }
+}
+
+fn files_stale(state: &AppState) -> bool {
+    state
+        .files
+        .scanned_at
+        .lock()
+        .ok()
+        .and_then(|scanned_at| *scanned_at)
+        .is_none_or(|scanned_at| scanned_at.elapsed() >= FILE_SCAN_STALE)
 }
 
 fn path_for(state: &AppState, id: u32) -> Result<PathBuf, String> {
@@ -810,13 +1095,25 @@ pub fn run() {
                 .build(),
         )
         .setup(|app| {
-            let shortcut = settings::load_shortcut(app.handle());
+            let prefs = settings::load(app.handle());
+            let shortcut = prefs.shortcut.clone();
             app.manage(AppState {
                 index: Mutex::new(Vec::new()),
                 index_ready: AtomicBool::new(false),
                 icons: Mutex::new(IconCache {
                     ready: HashMap::new(),
                 }),
+                files: FileState {
+                    enabled: AtomicBool::new(prefs.file_search),
+                    types: Mutex::new(prefs.file_types.clone()),
+                    entries: Mutex::new(Vec::new()),
+                    ready: AtomicBool::new(false),
+                    scanning: AtomicBool::new(false),
+                    scanned_at: Mutex::new(None),
+                    hits: Mutex::new(HashMap::new()),
+                    icons: Mutex::new(HashMap::new()),
+                    next_id: AtomicU32::new(1),
+                },
                 shown_at: Mutex::new(Instant::now() - Duration::from_secs(60)),
                 blur_until: Mutex::new(Instant::now() - Duration::from_secs(60)),
                 settings_open: AtomicBool::new(false),
@@ -829,6 +1126,9 @@ pub fn run() {
                 .name("veery-index".into())
                 .spawn(move || reload_catalog(&handle))
                 .ok();
+            if prefs.file_search {
+                spawn_file_scan(app.handle());
+            }
             if register_shortcut(app.handle(), &shortcut).is_err() {
                 let fallback = settings::DEFAULT_SHORTCUT.to_string();
                 let _ = register_shortcut(app.handle(), &fallback);
@@ -905,6 +1205,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             search,
+            search_files,
+            open_file,
+            reveal_file,
+            set_file_search,
+            set_file_types,
             refresh_index,
             launch,
             launch_admin,

@@ -9,7 +9,11 @@ use winreg::RegKey;
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_KEY_CMD: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+/// 测试进程不能覆盖已安装程序的 Run 项，否则开发者本机的开机启动会被测试清掉。
+#[cfg(not(test))]
 const RUN_NAME: &str = "Veery";
+#[cfg(test)]
+const RUN_NAME: &str = "VeeryTest";
 const SERIALIZE_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Serialize";
 const STARTUP_DELAY_VALUE: &str = "StartupDelayInMSec";
 const WAIT_FOR_IDLE_VALUE: &str = "WaitForIdleState";
@@ -26,6 +30,13 @@ pub const GITEE_REPO: &str = "https://gitee.com/li-xiantong/veery";
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct FileTypeInfo {
+    pub id: String,
+    pub extensions: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SettingsInfo {
     pub autostart: bool,
     pub fast_autostart: bool,
@@ -34,6 +45,9 @@ pub struct SettingsInfo {
     pub language: String,
     pub theme: String,
     pub hint: String,
+    pub file_search: bool,
+    pub file_types: Vec<String>,
+    pub file_type_options: Vec<FileTypeInfo>,
     pub name: &'static str,
     pub version: &'static str,
     pub author: &'static str,
@@ -47,6 +61,8 @@ pub struct Preferences {
     pub theme: String,
     pub hint: String,
     pub fast_autostart: bool,
+    pub file_search: bool,
+    pub file_types: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -60,6 +76,10 @@ struct Saved {
     hint: String,
     #[serde(default)]
     fast_autostart: bool,
+    #[serde(default)]
+    file_search: bool,
+    #[serde(default = "default_file_types")]
+    file_types: Vec<String>,
 }
 
 fn default_language() -> String {
@@ -68,6 +88,10 @@ fn default_language() -> String {
 
 fn default_theme() -> String {
     "light".to_string()
+}
+
+fn default_file_types() -> Vec<String> {
+    vec!["document".to_string(), "image".to_string()]
 }
 
 pub fn normalize_language(value: &str) -> String {
@@ -106,6 +130,15 @@ pub fn info(autostart: bool, fast_autostart: bool, prefs: &Preferences) -> Setti
         language: prefs.language.clone(),
         theme: prefs.theme.clone(),
         hint: prefs.hint.clone(),
+        file_search: prefs.file_search,
+        file_types: prefs.file_types.clone(),
+        file_type_options: crate::files::GROUPS
+            .iter()
+            .map(|(id, extensions)| FileTypeInfo {
+                id: (*id).to_string(),
+                extensions: extensions.iter().map(|extension| (*extension).to_string()).collect(),
+            })
+            .collect(),
         name: "Veery",
         version: env!("CARGO_PKG_VERSION"),
         author: "Xiantong Li",
@@ -208,8 +241,11 @@ pub fn load(app: &AppHandle) -> Preferences {
             theme: default_theme(),
             hint: String::new(),
             fast_autostart: false,
+            file_search: false,
+            file_types: default_file_types(),
         };
     };
+    let file_types = crate::files::normalize_types(&saved.file_types);
     Preferences {
         shortcut: if has_modifier(&saved.shortcut) {
             saved.shortcut
@@ -220,11 +256,10 @@ pub fn load(app: &AppHandle) -> Preferences {
         theme: normalize_theme(&saved.theme),
         hint: normalize_hint(&saved.hint),
         fast_autostart: saved.fast_autostart,
+        file_search: saved.file_search,
+        // 用户明确关掉全部类型就保持为空；只有旧设置缺这个字段时才用默认值。
+        file_types,
     }
-}
-
-pub fn load_shortcut(app: &AppHandle) -> String {
-    load(app).shortcut
 }
 
 pub fn save_shortcut(app: &AppHandle, shortcut: &str) -> Result<(), String> {
@@ -262,6 +297,8 @@ fn store(app: &AppHandle, prefs: &Preferences) -> Result<(), String> {
         theme: prefs.theme.clone(),
         hint: prefs.hint.clone(),
         fast_autostart: prefs.fast_autostart,
+        file_search: prefs.file_search,
+        file_types: prefs.file_types.clone(),
     })
     .map_err(|error| error.to_string())?;
     let temp = path.with_extension("json.tmp");
@@ -308,6 +345,20 @@ pub fn save_fast_autostart(app: &AppHandle, enabled: bool) -> Result<(), String>
     let mut prefs = load(app);
     prefs.fast_autostart = enabled;
     store(app, &prefs)
+}
+
+pub fn save_file_search(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let mut prefs = load(app);
+    prefs.file_search = enabled;
+    store(app, &prefs)
+}
+
+pub fn save_file_types(app: &AppHandle, types: &[String]) -> Result<Vec<String>, String> {
+    let normalized = crate::files::normalize_types(types);
+    let mut prefs = load(app);
+    prefs.file_types = normalized.clone();
+    store(app, &prefs)?;
+    Ok(normalized)
 }
 
 /// 只写 / 删 HKCU Run。绝不碰启动延迟——那是另一个开关。
@@ -606,6 +657,9 @@ fn config_file(app: &AppHandle) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
+    /// 这几个测试改的是同一份 HKCU 注册表项，并行跑会互相覆盖开关状态。
+    static REGISTRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn decodes_gbk_console_errors() {
         // “错误: 拒绝访问。” 的 GBK 字节；按 UTF-8 会读成替换符。
@@ -618,7 +672,14 @@ mod tests {
     }
 
     #[test]
+    fn tests_use_a_separate_autostart_entry() {
+        // 值名必须和生产版不同，否则测试会改掉本机已安装 Veery 的开机启动。
+        assert_ne!(RUN_NAME, "Veery");
+    }
+
+    #[test]
     fn autostart_round_trip() {
+        let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         // 测试进程是 veery_lib-*.exe，不能写回用户原来的开机项，否则登录会启动测试二进制并可能弹控制台。
         let _ = apply_fast_autostart(false);
         let _ = set_autostart(false);
@@ -649,6 +710,7 @@ mod tests {
 
     #[test]
     fn enabling_autostart_does_not_touch_startup_delay() {
+        let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let _ = apply_fast_autostart(false);
         let _ = set_autostart(false);
         assert!(!startup_delay_disabled());
@@ -660,6 +722,7 @@ mod tests {
 
     #[test]
     fn fast_autostart_toggle_stays_under_200ms() {
+        let _guard = REGISTRY_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         // 优先加速只能碰 HKCU 注册表；一旦又拖进外部进程，这个门槛会立刻打脸。
         let _ = apply_fast_autostart(false);
         let _ = set_autostart(false);
@@ -702,12 +765,23 @@ mod tests {
     }
 
     #[test]
+    fn empty_file_types_stay_empty_but_missing_ones_default() {
+        let empty: Saved =
+            serde_json::from_str(r#"{"shortcut":"Alt+Space","file_types":[]}"#).expect("parse");
+        assert!(empty.file_types.is_empty());
+        let missing: Saved = serde_json::from_str(r#"{"shortcut":"Alt+Space"}"#).expect("parse");
+        assert_eq!(missing.file_types, vec!["document", "image"]);
+    }
+
+    #[test]
     fn old_settings_keep_chinese_and_light() {
         let saved: Saved = serde_json::from_str(r#"{"shortcut":"Alt+Space"}"#).expect("parse");
         assert_eq!(saved.language, "zh");
         assert_eq!(saved.theme, "light");
         assert_eq!(saved.hint, "");
         assert!(!saved.fast_autostart);
+        assert!(!saved.file_search);
+        assert_eq!(saved.file_types, vec!["document", "image"]);
         assert_eq!(normalize_hint("  今天想打开什么  "), "今天想打开什么");
         assert_eq!(normalize_hint("123456789012345678901"), "12345678901234567890");
         assert_eq!(normalize_hint("a\nb"), "ab");

@@ -30,11 +30,14 @@ const emit = defineEmits<{
   themeChange: [ThemeChoice];
   hintChange: [string];
   recordingChange: [boolean];
+  filesChange: [boolean];
+  fileTypesChange: [number];
 }>();
 
-const page = ref<"general" | "about">("general");
+const page = ref<"general" | "files" | "about">("general");
 const menuEl = ref<HTMLElement | null>(null);
 const generalEl = ref<HTMLButtonElement | null>(null);
+const filesEl = ref<HTMLButtonElement | null>(null);
 const aboutEl = ref<HTMLButtonElement | null>(null);
 const selectionReady = ref(false);
 const selection = ref({ y: 0, height: 0 });
@@ -42,6 +45,8 @@ const info = ref<SettingsInfo | null>(settingsPanelCache.value ?? inject(prefsKe
 const switchReady = ref(false);
 const recording = ref(false);
 const message = ref("");
+const toast = ref("");
+let toastTimer = 0;
 const checking = ref(false);
 const updateState = ref<"idle" | "checking" | "current" | "available" | "failed">("idle");
 const latestVersion = ref("");
@@ -84,7 +89,11 @@ watch(
 watch(
   () => props.active,
   (active) => {
-    if (!active) return;
+    if (!active) {
+      window.clearTimeout(toastTimer);
+      toast.value = "";
+      return;
+    }
     void nextTick(() => {
       moveSelection();
       requestAnimationFrame(() => {
@@ -96,7 +105,8 @@ watch(
 );
 
 function moveSelection() {
-  const button = page.value === "general" ? generalEl.value : aboutEl.value;
+  const button =
+    page.value === "general" ? generalEl.value : page.value === "files" ? filesEl.value : aboutEl.value;
   if (!button) return;
   selection.value = { y: button.offsetTop, height: button.offsetHeight };
 }
@@ -109,6 +119,8 @@ async function load() {
   emit("hintChange", next.hint);
   emit("languageChange", languageOf(next.language));
   emit("themeChange", themeOf(next.theme));
+  emit("filesChange", next.fileSearch);
+  emit("fileTypesChange", next.fileTypes.length);
   await nextTick();
   requestAnimationFrame(() => {
     switchReady.value = true;
@@ -165,6 +177,87 @@ function toggleFastAutostart() {
       if (mine === fastAutostartTicket && info.value) {
         info.value.fastAutostart = !enabled;
         settingsPanelCache.value = info.value;
+        message.value = errorText(cause);
+      }
+    }
+  });
+}
+
+const fileGroups = computed(() => {
+  const labels: Record<string, string> = {
+    document: t.value.typeDocument,
+    image: t.value.typeImage,
+    media: t.value.typeMedia,
+    archive: t.value.typeArchive,
+    code: t.value.typeCode,
+  };
+  return (info.value?.fileTypeOptions ?? []).map((option) => ({
+    id: option.id,
+    label: labels[option.id] ?? option.id,
+    hint: t.value.typeHintPrefix + option.extensions.join(t.value.typeHintSeparator),
+  }));
+});
+
+let fileWrite = Promise.resolve();
+let fileSearchTicket = 0;
+let fileTypesTicket = 0;
+
+function toggleFileSearch() {
+  if (!info.value) return;
+  const enabled = !info.value.fileSearch;
+  const mine = ++fileSearchTicket;
+  info.value.fileSearch = enabled;
+  settingsPanelCache.value = info.value;
+  emit("filesChange", enabled);
+  message.value = "";
+  fileWrite = fileWrite.then(async () => {
+    try {
+      await invoke("set_file_search", { enabled });
+    } catch (cause) {
+      if (mine === fileSearchTicket && info.value) {
+        info.value.fileSearch = !enabled;
+        settingsPanelCache.value = info.value;
+        emit("filesChange", !enabled);
+        message.value = errorText(cause);
+      }
+    }
+  });
+}
+
+function showToast(text: string) {
+  window.clearTimeout(toastTimer);
+  toast.value = text;
+  toastTimer = window.setTimeout(() => {
+    toast.value = "";
+  }, 1600);
+}
+
+function toggleFileType(id: string) {
+  if (!info.value) return;
+  if (!info.value.fileSearch) {
+    showToast(t.value.fileSearchFirst);
+    return;
+  }
+  const current = info.value.fileTypes;
+  const next = current.includes(id) ? current.filter((type) => type !== id) : [...current, id];
+  const mine = ++fileTypesTicket;
+  info.value.fileTypes = next;
+  settingsPanelCache.value = info.value;
+  emit("fileTypesChange", next.length);
+  message.value = "";
+  fileWrite = fileWrite.then(async () => {
+    try {
+      const saved = await invoke<string[]>("set_file_types", { types: next });
+      if (mine === fileTypesTicket && info.value) {
+        info.value.fileTypes = saved;
+        settingsPanelCache.value = info.value;
+        emit("fileTypesChange", saved.length);
+      }
+    } catch (cause) {
+      if (mine === fileTypesTicket && info.value) {
+        info.value.fileTypes = current;
+        settingsPanelCache.value = info.value;
+        emit("fileTypesChange", current.length);
         message.value = errorText(cause);
       }
     }
@@ -358,6 +451,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  window.clearTimeout(toastTimer);
   menuObserver?.disconnect();
   window.removeEventListener("keydown", onKeydown, true);
   for (const stop of stops) stop();
@@ -374,17 +468,18 @@ defineExpose({
 
 <template>
   <div class="settings">
+    <Transition name="toast">
+      <div v-if="toast" class="toast" role="status">{{ toast }}</div>
+    </Transition>
     <aside>
       <img class="brand" :src="logo" alt="Veery" />
       <nav ref="menuEl" class="sidebar">
         <span class="indicator" :class="{ ready: selectionReady }" :style="selectionStyle"></span>
-        <button
-          ref="generalEl"
-          type="button"
-          :class="{ current: page === 'general' }"
-          @click="page = 'general'"
-        >
+        <button ref="generalEl" type="button" :class="{ current: page === 'general' }" @click="page = 'general'">
           {{ t.general }}
+        </button>
+        <button ref="filesEl" type="button" :class="{ current: page === 'files' }" @click="page = 'files'">
+          {{ t.files }}
         </button>
         <button ref="aboutEl" type="button" :class="{ current: page === 'about' }" @click="page = 'about'">
           {{ t.about }}
@@ -479,6 +574,64 @@ defineExpose({
       <p v-if="message" class="message">{{ message }}</p>
     </section>
 
+    <section v-else-if="page === 'files'" class="pane">
+      <h1>{{ t.files }}</h1>
+      <div class="row">
+        <div>
+          <p class="title with-info">
+            {{ t.fileSearch }}
+            <button type="button" class="info" :aria-label="t.fileSearchHint">
+              <span aria-hidden="true">!</span>
+              <span class="tip" role="tooltip">{{ t.fileSearchHint }}</span>
+            </button>
+          </p>
+          <p class="desc">{{ t.fileSearchDesc }}</p>
+        </div>
+        <button
+          type="button"
+          class="switch"
+          :class="{ on: info?.fileSearch, ready: switchReady }"
+          :aria-pressed="info?.fileSearch"
+          @click="toggleFileSearch"
+        >
+          <span></span>
+        </button>
+      </div>
+      <div class="row stacked">
+        <div>
+          <p class="title">{{ t.fileTypes }}</p>
+          <p class="desc">{{ t.fileTypesDesc }}</p>
+        </div>
+        <div class="type-list" :class="{ dim: !info?.fileSearch }">
+          <div
+            v-for="group in fileGroups"
+            :key="group.id"
+            class="type-row"
+            @click="toggleFileType(group.id)"
+          >
+            <div class="type-name">
+              <span>{{ group.label }}</span>
+              <button type="button" class="info up" :aria-label="group.hint" @click.stop>
+                <span aria-hidden="true">!</span>
+                <span class="tip" role="tooltip">{{ group.hint }}</span>
+              </button>
+            </div>
+            <button
+              type="button"
+              class="switch small"
+              :class="{ on: info?.fileTypes.includes(group.id), ready: switchReady }"
+              :aria-pressed="info?.fileTypes.includes(group.id)"
+              :aria-label="group.label"
+              @click.stop="toggleFileType(group.id)"
+            >
+              <span></span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <p v-if="message" class="message">{{ message }}</p>
+    </section>
+
     <section v-else class="pane">
       <h1>{{ t.about }}</h1>
       <p class="name">{{ info?.name || "Veery" }}</p>
@@ -523,6 +676,36 @@ defineExpose({
   height: 400px;
   color: var(--panel-text);
   background: var(--sheet);
+}
+
+.toast {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  z-index: 30;
+  max-width: calc(100% - 40px);
+  padding: 8px 16px;
+  border-radius: 10px;
+  background: var(--panel-strong);
+  color: var(--sheet);
+  font-size: 13px;
+  white-space: nowrap;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  pointer-events: none;
+  transform: translateX(-50%);
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease;
+}
+
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
+  transform: translate(-50%, -18px);
 }
 
 aside {
@@ -615,10 +798,115 @@ h1 {
   opacity: 0.55;
 }
 
+.row.stacked {
+  display: block;
+}
+
+.type-list {
+  margin-top: 12px;
+  padding: 0 16px;
+  border-radius: 12px;
+  background: var(--panel-row);
+}
+
+.type-list.dim {
+  opacity: 0.55;
+}
+
+.type-list.dim .type-row:hover {
+  background: transparent;
+}
+
+.type-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 46px;
+  margin: 0 -8px;
+  padding: 0 8px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.type-row + .type-row {
+  border-top: 1px solid var(--panel-line);
+}
+
+.type-row:hover {
+  background: var(--panel-choice);
+}
+
+.type-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--panel-strong);
+  font-size: 13px;
+}
+
 .title {
   margin: 0 0 4px;
   color: var(--panel-strong);
   font-size: 14px;
+}
+
+.title.with-info {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.info {
+  position: relative;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid var(--panel-muted);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--panel-muted);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  cursor: help;
+}
+
+.info .tip {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: -8px;
+  z-index: 5;
+  width: 236px;
+  box-sizing: border-box;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--menu-bg);
+  color: var(--menu-text);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: left;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 0.15s ease;
+}
+
+.info:hover .tip,
+.info:focus-visible .tip {
+  opacity: 1;
+  visibility: visible;
+}
+
+.info.up .tip {
+  top: auto;
+  bottom: calc(100% + 8px);
 }
 
 .desc,
@@ -661,6 +949,20 @@ h1 {
 .switch.on span {
   background: var(--panel-knob-on);
   transform: translateX(18px);
+}
+
+.switch.small {
+  width: 36px;
+  height: 22px;
+}
+
+.switch.small span {
+  width: 16px;
+  height: 16px;
+}
+
+.switch.small.on span {
+  transform: translateX(14px);
 }
 
 .switch.muted,

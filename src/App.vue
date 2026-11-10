@@ -15,7 +15,12 @@ import {
 } from "./prefs";
 
 type Hit = { id: number; name: string; icon: string | null };
+type FileHit = { id: number; name: string; icon: string | null };
+type Row =
+  | { kind: "app"; id: number; name: string; icon: string | null }
+  | { kind: "file"; id: number; name: string; icon: string | null };
 type SearchBody = { ready: boolean; hits: Hit[] };
+type FileSearchBody = { ready: boolean; hits: FileHit[] };
 
 const initial = inject(prefsKey, null);
 const language = ref<Language>(languageOf(initial?.language));
@@ -26,6 +31,11 @@ const placeholder = computed(() => hint.value || t.value.search);
 
 const query = ref("");
 const results = ref<Hit[]>([]);
+const fileHits = ref<FileHit[]>([]);
+const fileSearchOn = ref(Boolean(initial?.fileSearch));
+const fileTypeCount = ref(initial?.fileTypes.length ?? 0);
+const fileSearching = ref(false);
+const fileIndexing = ref(false);
 const answered = ref("");
 const indexing = ref(false);
 const searching = ref(false);
@@ -39,23 +49,51 @@ let suppressSettingsFocusClose = false;
 const inputEl = ref<HTMLInputElement | null>(null);
 const sheetEl = ref<HTMLElement | null>(null);
 const menuEl = ref<HTMLElement | null>(null);
-const menu = ref<{ id: number; x: number; y: number } | null>(null);
+const menu = ref<{ kind: "app" | "file"; id: number; x: number; y: number } | null>(null);
 const panelEl = ref<InstanceType<typeof SettingsPanel> | null>(null);
 let request = 0;
+let fileRequest = 0;
 
 const settled = computed(() => query.value.trim() !== "" && answered.value === query.value);
+const fileWanted = computed(
+  () =>
+    fileSearchOn.value &&
+    fileTypeCount.value > 0 &&
+    !settingsOpen.value &&
+    query.value.trim().length >= 2,
+);
+const rows = computed<Row[]>(() => [
+  ...results.value.map((hit) => ({ kind: "app" as const, ...hit })),
+  ...fileHits.value.map((hit) => ({ kind: "file" as const, ...hit })),
+]);
+const appCount = computed(() => results.value.length);
 const searchOpen = computed(
   () =>
     !settingsOpen.value &&
     (Boolean(error.value) ||
       indexing.value ||
       searching.value ||
-      (query.value.trim() !== "" && (results.value.length > 0 || settled.value))),
+      fileIndexing.value ||
+      fileSearching.value ||
+      (query.value.trim() !== "" && (results.value.length > 0 || fileHits.value.length > 0 || settled.value))),
 );
+const note = computed<{ text: string; error: boolean } | null>(() => {
+  if (error.value) return { text: error.value, error: true };
+  if (results.value.length > 0 || fileHits.value.length > 0) return null;
+  if (indexing.value) return { text: t.value.indexing, error: false };
+  if (fileIndexing.value) return { text: t.value.indexingFiles, error: false };
+  if (searching.value) return { text: t.value.searching, error: false };
+  if (fileSearching.value) return { text: t.value.searchingFiles, error: false };
+  if (settled.value) {
+    return { text: fileWanted.value ? t.value.emptyAll : t.value.empty, error: false };
+  }
+  return null;
+});
 const drawerOpen = computed(() => settingsOpen.value || searchOpen.value);
 
 const DRAWER_MS = 280;
 let searchTimer = 0;
+let fileTimer = 0;
 let frameTimer = 0;
 let settingsWarmTimer = 0;
 let resultsClearTimer = 0;
@@ -82,10 +120,19 @@ watch(
   { flush: "sync" },
 );
 
+function resetFiles() {
+  window.clearTimeout(fileTimer);
+  fileRequest += 1;
+  fileSearching.value = false;
+  fileIndexing.value = false;
+  fileHits.value = [];
+}
+
 function clearSearch(immediate = false) {
   window.clearTimeout(searchTimer);
   window.clearTimeout(resultsClearTimer);
   request += 1;
+  resetFiles();
   query.value = "";
   answered.value = "";
   indexing.value = false;
@@ -163,8 +210,12 @@ function scheduleRefresh() {
   window.clearTimeout(searchTimer);
   const text = query.value;
   menu.value = null;
-  if (settingsOpen.value) return;
+  if (settingsOpen.value) {
+    resetFiles();
+    return;
+  }
   if (!text.trim()) {
+    resetFiles();
     request += 1;
     answered.value = "";
     indexing.value = false;
@@ -183,6 +234,7 @@ function scheduleRefresh() {
     return;
   }
   window.clearTimeout(resultsClearTimer);
+  scheduleFileRefresh();
   if (text === answered.value && !error.value && !indexing.value && !searching.value) return;
   // 还没有可展示的结果时先进入搜索中，抽屉展开并给出反馈，避免干等像卡住。
   if (results.value.length === 0) {
@@ -191,6 +243,51 @@ function scheduleRefresh() {
   searchTimer = window.setTimeout(() => {
     void refresh();
   }, 40);
+}
+
+function scheduleFileRefresh() {
+  window.clearTimeout(fileTimer);
+  if (!fileWanted.value) {
+    resetFiles();
+    return;
+  }
+  // 文件范围比程序大，防抖久一点，避免每个按键都扫一遍。
+  if (fileHits.value.length === 0) {
+    fileSearching.value = true;
+  }
+  fileTimer = window.setTimeout(() => {
+    void refreshFiles();
+  }, 300);
+}
+
+async function refreshFiles() {
+  const current = ++fileRequest;
+  const text = query.value.trim();
+  if (!fileWanted.value || text.length < 2) {
+    fileSearching.value = false;
+    return;
+  }
+  try {
+    const body = await invoke<FileSearchBody>("search_files", { query: text });
+    if (current !== fileRequest || !fileWanted.value) return;
+    if (!body.ready) {
+      fileIndexing.value = true;
+      fileSearching.value = false;
+      fileHits.value = [];
+      return;
+    }
+    fileIndexing.value = false;
+    fileSearching.value = false;
+    fileHits.value = body.hits;
+    if (selected.value >= results.value.length + fileHits.value.length) {
+      selected.value = 0;
+    }
+  } catch {
+    if (current !== fileRequest) return;
+    fileIndexing.value = false;
+    fileSearching.value = false;
+    fileHits.value = [];
+  }
 }
 
 async function refresh() {
@@ -216,7 +313,7 @@ async function refresh() {
     results.value = body.hits;
     answered.value = text;
     searching.value = false;
-    if (selected.value >= results.value.length) {
+    if (selected.value >= results.value.length + fileHits.value.length) {
       selected.value = 0;
     }
   } catch (cause) {
@@ -242,17 +339,52 @@ async function act(command: "launch" | "launch_admin" | "reveal", id: number) {
   }
 }
 
+async function openFile(id: number) {
+  menu.value = null;
+  error.value = "";
+  try {
+    await invoke("open_file", { id });
+    query.value = "";
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
+async function revealFile(id: number) {
+  menu.value = null;
+  error.value = "";
+  try {
+    await invoke("reveal_file", { id });
+    query.value = "";
+  } catch (cause) {
+    error.value = String(cause);
+  }
+}
+
 async function openSelected() {
-  const hit = results.value[selected.value];
-  if (!hit) return;
-  await act("launch", hit.id);
+  const row = rows.value[selected.value];
+  if (!row) return;
+  if (row.kind === "app") {
+    await act("launch", row.id);
+  } else {
+    await openFile(row.id);
+  }
 }
 
 async function openMenu(index: number, event: MouseEvent) {
   const hit = results.value[index];
   if (!hit) return;
   selected.value = index;
-  menu.value = { id: hit.id, x: event.clientX, y: event.clientY };
+  menu.value = { kind: "app", id: hit.id, x: event.clientX, y: event.clientY };
+  await invoke("set_launcher_frame", { mode: "open" }).catch(() => undefined);
+  await placeMenu();
+}
+
+async function openFileMenu(index: number, event: MouseEvent) {
+  const hit = fileHits.value[index];
+  if (!hit) return;
+  selected.value = appCount.value + index;
+  menu.value = { kind: "file", id: hit.id, x: event.clientX, y: event.clientY };
   await invoke("set_launcher_frame", { mode: "open" }).catch(() => undefined);
   await placeMenu();
 }
@@ -295,7 +427,7 @@ async function placeAt(node: HTMLElement | null, point: { x: number; y: number }
 async function placeMenu() {
   const placed = await placeAt(menuEl.value, menu.value);
   if (!placed || !menu.value) return;
-  menu.value = { id: menu.value.id, x: placed.x, y: placed.y };
+  menu.value = { ...menu.value, x: placed.x, y: placed.y };
 }
 
 function onKeydown(event: KeyboardEvent) {
@@ -317,17 +449,26 @@ function onKeydown(event: KeyboardEvent) {
   if (settingsOpen.value) return;
   if (event.key === "ArrowDown") {
     event.preventDefault();
-    if (results.value.length === 0) return;
-    selected.value = (selected.value + 1) % results.value.length;
+    if (rows.value.length === 0) return;
+    selected.value = (selected.value + 1) % rows.value.length;
   } else if (event.key === "ArrowUp") {
     event.preventDefault();
-    if (results.value.length === 0) return;
-    selected.value =
-      (selected.value + results.value.length - 1) % results.value.length;
+    if (rows.value.length === 0) return;
+    selected.value = (selected.value + rows.value.length - 1) % rows.value.length;
   } else if (event.key === "Enter") {
     event.preventDefault();
     void openSelected();
   }
+}
+
+function onFilesChange(enabled: boolean) {
+  fileSearchOn.value = enabled;
+  scheduleFileRefresh();
+}
+
+function onFileTypesChange(count: number) {
+  fileTypeCount.value = count;
+  scheduleFileRefresh();
 }
 
 async function focusInput() {
@@ -398,6 +539,13 @@ onMounted(async () => {
       }),
     );
     stops.push(
+      await listen("files-ready", () => {
+        if (!fileWanted.value) return;
+        window.clearTimeout(fileTimer);
+        void refreshFiles();
+      }),
+    );
+    stops.push(
       await listen<{ language: string; theme: string }>("appearance", (event) => {
         language.value = languageOf(event.payload.language);
         theme.value = themeOf(event.payload.theme);
@@ -418,6 +566,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.clearTimeout(searchTimer);
+  window.clearTimeout(fileTimer);
   window.clearTimeout(frameTimer);
   window.clearTimeout(settingsWarmTimer);
   window.clearTimeout(resultsClearTimer);
@@ -472,11 +621,12 @@ onUnmounted(() => {
             @theme-change="theme = $event"
             @hint-change="hint = $event"
             @recording-change="recording = $event"
+            @files-change="onFilesChange"
+            @file-types-change="onFileTypesChange"
           />
           <template v-if="!settingsOpen">
-            <p v-if="error" class="note error">{{ error }}</p>
-            <ul v-else-if="results.length" class="results">
-              <li v-for="(item, index) in results" :key="item.id">
+            <ul v-if="rows.length" class="results">
+              <li v-for="(item, index) in results" :key="`app-${item.id}`">
                 <button
                   type="button"
                   :class="{ active: index === selected }"
@@ -490,10 +640,27 @@ onUnmounted(() => {
                   <span class="name">{{ item.name }}</span>
                 </button>
               </li>
+              <template v-if="fileHits.length">
+                <li class="section" aria-hidden="true">
+                  <span>{{ t.filesSection }}</span>
+                </li>
+                <li v-for="(item, index) in fileHits" :key="`file-${item.id}`">
+                  <button
+                    type="button"
+                    :class="{ active: appCount + index === selected }"
+                    @mouseenter="selected = appCount + index"
+                    @mousedown.prevent
+                    @click="openFile(item.id)"
+                    @contextmenu.prevent="openFileMenu(index, $event)"
+                  >
+                    <img v-if="item.icon" class="icon" :src="item.icon" alt="" />
+                    <span v-else class="icon placeholder"></span>
+                    <span class="name">{{ item.name }}</span>
+                  </button>
+                </li>
+              </template>
             </ul>
-            <p v-else-if="indexing" class="note">{{ t.indexing }}</p>
-            <p v-else-if="searching" class="note">{{ t.searching }}</p>
-            <p v-else-if="settled" class="note">{{ t.empty }}</p>
+            <p v-else-if="note" class="note" :class="{ error: note.error }">{{ note.text }}</p>
           </template>
         </div>
       </div>
@@ -506,9 +673,15 @@ onUnmounted(() => {
       @mousedown.prevent
       @contextmenu.prevent
     >
-      <button type="button" @click="act('launch', menu.id)">{{ t.open }}</button>
-      <button type="button" @click="act('launch_admin', menu.id)">{{ t.admin }}</button>
-      <button type="button" @click="act('reveal', menu.id)">{{ t.folder }}</button>
+      <template v-if="menu.kind === 'file'">
+        <button type="button" @click="openFile(menu.id)">{{ t.open }}</button>
+        <button type="button" @click="revealFile(menu.id)">{{ t.folder }}</button>
+      </template>
+      <template v-else>
+        <button type="button" @click="act('launch', menu.id)">{{ t.open }}</button>
+        <button type="button" @click="act('launch_admin', menu.id)">{{ t.admin }}</button>
+        <button type="button" @click="act('reveal', menu.id)">{{ t.folder }}</button>
+      </template>
     </div>
   </main>
 </template>
@@ -708,6 +881,15 @@ body {
   list-style: none;
   margin: 0;
   padding: 6px 8px 8px;
+  max-height: 400px;
+  overflow-y: auto;
+}
+
+.results li.section {
+  padding: 8px 18px 4px;
+  color: var(--note);
+  font-size: 12px;
+  letter-spacing: 0.02em;
 }
 
 .results button {
