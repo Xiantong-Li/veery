@@ -57,6 +57,8 @@ struct AppState {
     files: FileState,
     shown_at: Mutex<Instant>,
     blur_until: Mutex<Instant>,
+    launched_at: Mutex<Instant>,
+    refocus_used: AtomicBool,
     settings_open: AtomicBool,
     last_query: Mutex<String>,
     shortcut: Mutex<String>,
@@ -77,6 +79,22 @@ fn mark_blur_guard(app: &AppHandle) {
             *until = Instant::now() + Duration::from_millis(800);
         }
     }
+}
+
+fn mark_launched(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        if let Ok(mut launched_at) = state.launched_at.lock() {
+            *launched_at = Instant::now();
+        }
+    }
+}
+
+/// 回车启动后立刻再唤出，程序窗口往往这时才弹出来抢走焦点：搜索条还在，按键却进了别的程序。
+fn focus_stolen_by_launch(state: &AppState) -> bool {
+    let (Ok(launched_at), Ok(shown_at)) = (state.launched_at.lock(), state.shown_at.lock()) else {
+        return false;
+    };
+    *shown_at >= *launched_at && launched_at.elapsed() < Duration::from_millis(2500)
 }
 
 fn set_memory_level(window: &tauri::WebviewWindow, low: bool) {
@@ -262,10 +280,14 @@ fn close_before(
     // 先关掉搜索条，再去做可能要等一会儿的启动。失败时再把原来的结果拿回来。
     let app = window.app_handle().clone();
     let _ = window.hide();
+    mark_launched(&app);
     match action() {
         Ok(()) => {
-            let _ = window.emit("hidden", ());
-            set_launcher_size(window, LAUNCHER_IDLE_HEIGHT);
+            // 启动期间用户可能已经再次唤出，这时再收一次会清空新会话并把窗口压回搜索条高度。
+            if !window.is_visible().unwrap_or(false) {
+                let _ = window.emit("hidden", ());
+                set_launcher_size(window, LAUNCHER_IDLE_HEIGHT);
+            }
             Ok(())
         }
         Err(error) => {
@@ -316,8 +338,9 @@ fn show_launcher(app: &AppHandle) {
         return;
     };
     mark_shown(app);
-    // 文件列表过期时在后台重扫；唤出本身不等它。
     if let Some(state) = app.try_state::<AppState>() {
+        state.refocus_used.store(false, Ordering::Release);
+        // 文件列表过期时在后台重扫；唤出本身不等它。
         if state.files.enabled.load(Ordering::Acquire)
             && (!state.files.ready.load(Ordering::Acquire) || files_stale(&state))
         {
@@ -1183,6 +1206,8 @@ pub fn run() {
                 },
                 shown_at: Mutex::new(Instant::now() - Duration::from_secs(60)),
                 blur_until: Mutex::new(Instant::now() - Duration::from_secs(60)),
+                launched_at: Mutex::new(Instant::now() - Duration::from_secs(60)),
+                refocus_used: AtomicBool::new(false),
                 settings_open: AtomicBool::new(false),
                 last_query: Mutex::new(String::new()),
                 shortcut: Mutex::new(shortcut.clone()),
@@ -1243,21 +1268,22 @@ pub fn run() {
             }
             WindowEvent::Focused(false) => {
                 let app = window.app_handle();
-                let state = app.try_state::<AppState>();
+                let Some(state) = app.try_state::<AppState>() else {
+                    return;
+                };
+                // 刚唤出就被自己启动的程序抢走焦点：拿回来一次，否则搜索条看着在，按键却进了别的程序。
+                if focus_stolen_by_launch(&state) && !state.refocus_used.swap(true, Ordering::AcqRel) {
+                    let _ = window.set_focus();
+                    return;
+                }
                 let recent = state
-                    .as_ref()
-                    .and_then(|state| {
-                        state
-                            .shown_at
-                            .lock()
-                            .ok()
-                            .map(|shown_at| shown_at.elapsed() < Duration::from_millis(300))
-                    })
-                    .unwrap_or(false);
+                    .shown_at
+                    .lock()
+                    .is_ok_and(|shown_at| shown_at.elapsed() < Duration::from_millis(300));
                 let guarded = state
-                    .as_ref()
-                    .and_then(|state| state.blur_until.lock().ok())
-                    .is_some_and(|until| *until > Instant::now());
+                    .blur_until
+                    .lock()
+                    .is_ok_and(|until| *until > Instant::now());
                 // 点桌面空白应隐藏（含设置中）；打开外链的短时失焦由 blur_until 挡住。
                 if !recent && !guarded {
                     hide_launcher(app);

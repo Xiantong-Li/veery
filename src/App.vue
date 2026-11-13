@@ -333,7 +333,7 @@ async function act(command: "launch" | "launch_admin" | "reveal", id: number) {
     } else {
       await invoke(command, { id, query: query.value });
     }
-    query.value = "";
+    // 输入框交给 hidden/shown 事件清空：启动要等一会儿，这里再清一次会抹掉再次唤出后已经输入的内容。
   } catch (cause) {
     error.value = String(cause);
   }
@@ -344,7 +344,6 @@ async function openFile(id: number) {
   error.value = "";
   try {
     await invoke("open_file", { id });
-    query.value = "";
   } catch (cause) {
     error.value = String(cause);
   }
@@ -355,7 +354,6 @@ async function revealFile(id: number) {
   error.value = "";
   try {
     await invoke("reveal_file", { id });
-    query.value = "";
   } catch (cause) {
     error.value = String(cause);
   }
