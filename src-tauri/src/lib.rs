@@ -39,6 +39,7 @@ struct FileState {
 const FILE_SCAN_STALE: Duration = Duration::from_secs(600);
 const FILE_HITS_CAP: usize = 3000;
 const FILE_ICONS_CAP: usize = 1024;
+const UPDATE_CHECK_STALE: Duration = Duration::from_secs(24 * 60 * 60);
 
 struct TrayItems {
     show: MenuItem<Wry>,
@@ -63,6 +64,8 @@ struct AppState {
     last_query: Mutex<String>,
     shortcut: Mutex<String>,
     tray: Mutex<Option<TrayItems>>,
+    update_checking: AtomicBool,
+    update_checked_at: Mutex<Option<Instant>>,
 }
 
 fn mark_shown(app: &AppHandle) {
@@ -349,6 +352,7 @@ fn show_launcher(app: &AppHandle) {
     }
     // 新装程序不靠定时重扫：唤出时比一下快捷方式指纹，变了才后台重扫。
     spawn_catalog_check(app);
+    spawn_update_check(app);
     set_memory_level(&window, false);
     // 唤出时只显示搜索条。列表区域留到真正展开时再加，避免空窗口被截得很高。
     set_launcher_size(&window, LAUNCHER_IDLE_HEIGHT);
@@ -1097,6 +1101,53 @@ async fn check_update() -> Result<update::UpdateInfo, String> {
         .map_err(|_| "offline".to_string())?
 }
 
+/// 唤出时惰性检查更新：一天最多一次，不用定时器，闲置时不联网。
+fn spawn_update_check(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    let fresh = state
+        .update_checked_at
+        .lock()
+        .ok()
+        .and_then(|checked_at| *checked_at)
+        .is_some_and(|checked_at| checked_at.elapsed() < UPDATE_CHECK_STALE);
+    if fresh || state.update_checking.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let app = app.clone();
+    let spawned = std::thread::Builder::new()
+        .name("veery-update".into())
+        .spawn(move || {
+            let checked = update::check(env!("CARGO_PKG_VERSION"));
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            state.update_checking.store(false, Ordering::Release);
+            // 没查成功就不记时间，下次唤出再试。
+            let Ok(info) = checked else {
+                return;
+            };
+            if let Ok(mut checked_at) = state.update_checked_at.lock() {
+                *checked_at = Some(Instant::now());
+            }
+            if info.available && info.latest != settings::load(&app).dismissed_update {
+                let _ = app.emit(
+                    "update-available",
+                    serde_json::json!({ "latest": info.latest, "url": info.url }),
+                );
+            }
+        });
+    if spawned.is_err() {
+        state.update_checking.store(false, Ordering::Release);
+    }
+}
+
+#[tauri::command]
+fn dismiss_update(app: AppHandle, version: String) -> Result<(), String> {
+    settings::save_dismissed_update(&app, &version)
+}
+
 #[tauri::command]
 fn open_link(app: AppHandle, url: String) -> Result<(), String> {
     // 关于页打开外链会失焦；短时间内不要因此把窗口藏起来。
@@ -1212,6 +1263,8 @@ pub fn run() {
                 last_query: Mutex::new(String::new()),
                 shortcut: Mutex::new(shortcut.clone()),
                 tray: Mutex::new(None),
+                update_checking: AtomicBool::new(false),
+                update_checked_at: Mutex::new(None),
             });
             spawn_catalog_scan(app.handle());
             if prefs.file_search {
@@ -1313,6 +1366,7 @@ pub fn run() {
             set_search_hint,
             set_theme,
             check_update,
+            dismiss_update,
             open_link,
             pause_shortcut,
             restore_shortcut,

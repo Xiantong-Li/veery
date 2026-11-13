@@ -45,6 +45,7 @@ const settingsOpen = ref(false);
 const settingsMounted = ref(false);
 const resumeSettings = ref(false);
 const recording = ref(false);
+const update = ref<{ latest: string; url: string } | null>(null);
 let suppressSettingsFocusClose = false;
 const inputEl = ref<HTMLInputElement | null>(null);
 const sheetEl = ref<HTMLElement | null>(null);
@@ -469,6 +470,14 @@ function onFileTypesChange(count: number) {
   scheduleFileRefresh();
 }
 
+function dismissUpdate() {
+  const current = update.value;
+  update.value = null;
+  if (current) {
+    void invoke("dismiss_update", { version: current.latest }).catch(() => undefined);
+  }
+}
+
 async function focusInput() {
   await nextTick();
   inputEl.value?.focus();
@@ -544,6 +553,11 @@ onMounted(async () => {
       }),
     );
     stops.push(
+      await listen<{ latest: string; url: string }>("update-available", (event) => {
+        update.value = event.payload;
+      }),
+    );
+    stops.push(
       await listen<{ language: string; theme: string }>("appearance", (event) => {
         language.value = languageOf(event.payload.language);
         theme.value = themeOf(event.payload.theme);
@@ -603,6 +617,7 @@ onUnmounted(() => {
               d="M19.14 12.94c.04-.31.06-.63.06-.94s-.02-.63-.06-.94l2.03-1.58a.49.49 0 0 0 .12-.61l-1.92-3.32a.49.49 0 0 0-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.48.48 0 0 0-.48-.41h-3.84a.48.48 0 0 0-.48.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 0 0-.59.22L2.74 8.87a.48.48 0 0 0 .12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 0 0-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.48-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32a.48.48 0 0 0-.12-.61l-2.03-1.58zM12 15.6A3.6 3.6 0 1 1 12 8.4a3.6 3.6 0 0 1 0 7.2z"
             />
           </svg>
+          <span v-if="update" class="gear-dot" aria-hidden="true"></span>
         </button>
       </div>
       <div class="drawer" :class="{ open: drawerOpen }">
@@ -615,12 +630,14 @@ onUnmounted(() => {
             :theme="theme"
             :hint="hint"
             :active="settingsOpen"
+            :update="update"
             @language-change="language = $event"
             @theme-change="theme = $event"
             @hint-change="hint = $event"
             @recording-change="recording = $event"
             @files-change="onFilesChange"
             @file-types-change="onFileTypesChange"
+            @update-dismiss="dismissUpdate"
           />
           <template v-if="!settingsOpen">
             <ul v-if="rows.length" class="results">
@@ -815,6 +832,7 @@ body {
 }
 
 .gear {
+  position: relative;
   width: 40px;
   height: 40px;
   flex: none;
@@ -825,6 +843,17 @@ body {
   background: transparent;
   color: var(--gear);
   cursor: pointer;
+}
+
+.gear-dot {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #f5b800;
+  pointer-events: none;
 }
 
 .gear svg {

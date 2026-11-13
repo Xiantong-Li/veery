@@ -63,6 +63,7 @@ pub struct Preferences {
     pub fast_autostart: bool,
     pub file_search: bool,
     pub file_types: Vec<String>,
+    pub dismissed_update: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,6 +81,9 @@ struct Saved {
     file_search: bool,
     #[serde(default = "default_file_types")]
     file_types: Vec<String>,
+    /// 用户已经看过这个版本的提醒，不再为它显示圆点。
+    #[serde(default)]
+    dismissed_update: String,
 }
 
 fn default_language() -> String {
@@ -243,6 +247,7 @@ pub fn load(app: &AppHandle) -> Preferences {
             fast_autostart: false,
             file_search: false,
             file_types: default_file_types(),
+            dismissed_update: String::new(),
         };
     };
     let file_types = crate::files::normalize_types(&saved.file_types);
@@ -259,6 +264,7 @@ pub fn load(app: &AppHandle) -> Preferences {
         file_search: saved.file_search,
         // 用户明确关掉全部类型就保持为空；只有旧设置缺这个字段时才用默认值。
         file_types,
+        dismissed_update: saved.dismissed_update,
     }
 }
 
@@ -299,6 +305,7 @@ fn store(app: &AppHandle, prefs: &Preferences) -> Result<(), String> {
         fast_autostart: prefs.fast_autostart,
         file_search: prefs.file_search,
         file_types: prefs.file_types.clone(),
+        dismissed_update: prefs.dismissed_update.clone(),
     })
     .map_err(|error| error.to_string())?;
     let temp = path.with_extension("json.tmp");
@@ -359,6 +366,12 @@ pub fn save_file_types(app: &AppHandle, types: &[String]) -> Result<Vec<String>,
     prefs.file_types = normalized.clone();
     store(app, &prefs)?;
     Ok(normalized)
+}
+
+pub fn save_dismissed_update(app: &AppHandle, version: &str) -> Result<(), String> {
+    let mut prefs = load(app);
+    prefs.dismissed_update = version.to_string();
+    store(app, &prefs)
 }
 
 /// 只写 / 删 HKCU Run。绝不碰启动延迟——那是另一个开关。

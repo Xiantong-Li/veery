@@ -23,6 +23,7 @@ const props = defineProps<{
   theme: ThemeChoice;
   hint: string;
   active?: boolean;
+  update: { latest: string; url: string } | null;
 }>();
 
 const emit = defineEmits<{
@@ -32,6 +33,7 @@ const emit = defineEmits<{
   recordingChange: [boolean];
   filesChange: [boolean];
   fileTypesChange: [number];
+  updateDismiss: [];
 }>();
 
 const page = ref<"general" | "files" | "about">("general");
@@ -102,6 +104,17 @@ watch(
       });
     });
   },
+);
+
+watch(
+  () => props.update,
+  (value) => {
+    if (!value || updateState.value !== "idle") return;
+    latestVersion.value = value.latest.replace(/^v/, "");
+    updateState.value = "available";
+    updateUrl.value = value.url;
+  },
+  { immediate: true },
 );
 
 function moveSelection() {
@@ -313,6 +326,12 @@ async function saveHint() {
   }
 }
 
+function openAbout() {
+  page.value = "about";
+  // 看过就消掉圆点，不要求真的去安装。
+  if (props.update) emit("updateDismiss");
+}
+
 async function checkUpdate() {
   checking.value = true;
   updateState.value = "checking";
@@ -481,8 +500,9 @@ defineExpose({
         <button ref="filesEl" type="button" :class="{ current: page === 'files' }" @click="page = 'files'">
           {{ t.files }}
         </button>
-        <button ref="aboutEl" type="button" :class="{ current: page === 'about' }" @click="page = 'about'">
+        <button ref="aboutEl" type="button" :class="{ current: page === 'about' }" @click="openAbout">
           {{ t.about }}
+          <span v-if="update" class="nav-dot" aria-hidden="true"></span>
         </button>
       </nav>
     </aside>
@@ -767,6 +787,17 @@ aside button {
 
 aside button.current {
   color: var(--panel-strong);
+}
+
+.nav-dot {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #f5b800;
+  pointer-events: none;
 }
 
 .pane {
