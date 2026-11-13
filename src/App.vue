@@ -726,8 +726,8 @@ html[data-theme="dark"] {
   --panel-knob: #f2f2f2;
   --panel-knob-on: #1c1c1c;
   --shadow:
-    0 2px 6px rgba(0, 0, 0, 0.3),
-    0 12px 32px rgba(0, 0, 0, 0.45);
+    0 1px 3px rgba(0, 0, 0, 0.24),
+    0 6px 16px rgba(0, 0, 0, 0.3);
 }
 
 html[data-theme="light"],
@@ -762,8 +762,8 @@ html:not([data-theme]) {
   --panel-knob: #ffffff;
   --panel-knob-on: #ffffff;
   --shadow:
-    0 2px 6px rgba(0, 0, 0, 0.05),
-    0 12px 32px rgba(0, 0, 0, 0.1);
+    0 1px 3px rgba(0, 0, 0, 0.04),
+    0 6px 16px rgba(0, 0, 0, 0.07);
 }
 
 body {
