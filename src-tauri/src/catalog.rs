@@ -29,24 +29,24 @@ pub struct SearchHit {
 }
 
 pub fn scan() -> Result<Vec<AppEntry>, String> {
-    let dirs = start_menu_dirs();
+    let dirs = app_dirs();
     if dirs.is_empty() {
-        return Err("找不到开始菜单目录".to_string());
+        return Err("找不到快捷方式目录".to_string());
     }
     let mut saw_dir = false;
     let mut by_name = HashMap::new();
     let mut seen = HashSet::new();
-    for dir in dirs {
+    for (dir, depth) in dirs {
         if !dir.exists() {
             continue;
         }
         saw_dir = true;
-        collect(&dir, &mut by_name, &mut seen, 0);
+        collect(&dir, &mut by_name, &mut seen, 0, depth);
     }
     // 计算器、终端这类应用没有快捷方式，只登记在系统的应用列表里。
     collect_shell_apps(&mut by_name);
     if !saw_dir {
-        return Err("开始菜单目录不存在".to_string());
+        return Err("快捷方式目录不存在".to_string());
     }
 
     let mut apps: Vec<AppEntry> = by_name.into_values().collect();
@@ -61,18 +61,18 @@ pub fn search(apps: &[AppEntry], query: &str, limit: usize) -> Vec<SearchHit> {
     search_with_boost(apps, query, limit, |_, _| (0, 0))
 }
 
-/// 只列开始菜单里快捷方式的路径、修改时间和大小，不解快捷方式、不取图标。
+/// 只列快捷方式的路径、修改时间和大小，不解快捷方式、不取图标。
 /// 唤出时拿它和上次的值比，几毫秒就能判断有没有新装或卸载的程序。
 pub fn fingerprint() -> Option<u64> {
     let mut entries = Vec::new();
     let mut seen = HashSet::new();
     let mut saw_dir = false;
-    for dir in start_menu_dirs() {
+    for (dir, depth) in app_dirs() {
         if !dir.exists() {
             continue;
         }
         saw_dir = true;
-        collect_links(&dir, &mut entries, &mut seen, 0);
+        collect_links(&dir, &mut entries, &mut seen, 0, depth);
     }
     if !saw_dir {
         return None;
@@ -85,8 +85,9 @@ fn collect_links(
     into: &mut Vec<(String, u64, u64)>,
     seen: &mut HashSet<PathBuf>,
     depth: u8,
+    limit: u8,
 ) {
-    if depth > 12 {
+    if depth > limit {
         return;
     }
     let identity = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -104,7 +105,7 @@ fn collect_links(
             continue;
         };
         if kind.is_dir() {
-            collect_links(&path, into, seen, depth + 1);
+            collect_links(&path, into, seen, depth + 1, limit);
             continue;
         }
         let is_link = path
@@ -273,19 +274,39 @@ fn wide_str(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn start_menu_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
+/// 每个目录配一个允许往下翻的层数。桌面放在开始菜单前面，同名时以开始菜单的为准。
+fn app_dirs() -> Vec<(PathBuf, u8)> {
+    let mut dirs: Vec<(PathBuf, u8)> = desktop_dirs().into_iter().map(|dir| (dir, 0)).collect();
     if let Some(dir) = std::env::var_os("ProgramData") {
-        dirs.push(PathBuf::from(dir).join(r"Microsoft\Windows\Start Menu\Programs"));
+        dirs.push((PathBuf::from(dir).join(r"Microsoft\Windows\Start Menu\Programs"), 12));
     }
     if let Some(dir) = std::env::var_os("APPDATA") {
-        dirs.push(PathBuf::from(dir).join(r"Microsoft\Windows\Start Menu\Programs"));
+        dirs.push((PathBuf::from(dir).join(r"Microsoft\Windows\Start Menu\Programs"), 12));
     }
     dirs
 }
 
-fn collect(dir: &Path, into: &mut HashMap<String, AppEntry>, seen: &mut HashSet<PathBuf>, depth: u8) {
-    if depth > 12 {
+/// 有些程序只往桌面放快捷方式，开始菜单里没有；桌面只取顶层，不跟着进用户的文件夹。
+fn desktop_dirs() -> Vec<PathBuf> {
+    use windows::Win32::UI::Shell::{
+        SHGetKnownFolderPath, FOLDERID_Desktop, FOLDERID_PublicDesktop, KF_FLAG_DEFAULT,
+    };
+
+    [FOLDERID_Desktop, FOLDERID_PublicDesktop]
+        .iter()
+        .filter_map(|id| shell_string(unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None) }))
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn collect(
+    dir: &Path,
+    into: &mut HashMap<String, AppEntry>,
+    seen: &mut HashSet<PathBuf>,
+    depth: u8,
+    limit: u8,
+) {
+    if depth > limit {
         return;
     }
     let identity = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
@@ -300,7 +321,7 @@ fn collect(dir: &Path, into: &mut HashMap<String, AppEntry>, seen: &mut HashSet<
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect(&path, into, seen, depth + 1);
+            collect(&path, into, seen, depth + 1, limit);
             continue;
         }
         let is_link = path
@@ -1287,12 +1308,32 @@ mod tests {
         fs::write(second.join("记事本.lnk"), b"").unwrap();
         let mut into = HashMap::new();
         let mut seen = HashSet::new();
-        collect(&first, &mut into, &mut seen, 0);
-        collect(&second, &mut into, &mut seen, 0);
+        collect(&first, &mut into, &mut seen, 0, 12);
+        collect(&second, &mut into, &mut seen, 0, 12);
         let app = into.get("记事本").unwrap();
         assert!(app.path.starts_with(&second));
-        collect(&second, &mut into, &mut seen, 0);
+        collect(&second, &mut into, &mut seen, 0, 12);
         assert_eq!(into.len(), 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn depth_limit_skips_subdirectories() {
+        let root = std::env::temp_dir().join(format!("veery-depth-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let nested = root.join("folder");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(root.join("oss-browser.lnk"), b"").unwrap();
+        fs::write(nested.join("buried.lnk"), b"").unwrap();
+        let mut into = HashMap::new();
+        let mut seen = HashSet::new();
+        collect(&root, &mut into, &mut seen, 0, 0);
+        assert_eq!(into.len(), 1);
+        assert!(into.contains_key("oss-browser"));
+        let mut links = Vec::new();
+        let mut seen = HashSet::new();
+        collect_links(&root, &mut links, &mut seen, 0, 0);
+        assert_eq!(links.len(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 
