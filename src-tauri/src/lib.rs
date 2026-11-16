@@ -1,6 +1,8 @@
 mod catalog;
 mod files;
 mod history;
+mod mascot;
+mod net;
 mod settings;
 mod update;
 
@@ -244,10 +246,12 @@ fn tune_webview(window: &tauri::WebviewWindow) {
 }
 
 const LAUNCHER_WIDTH: f64 = 960.0;
-const LAUNCHER_IDLE_HEIGHT: f64 = 132.0;
-const LAUNCHER_OPEN_HEIGHT: f64 = 560.0;
-// 搜索条停在工作区上方，比贴顶再低一截。
-const LAUNCHER_TOP_RATIO: f64 = 0.26;
+const LAUNCHER_IDLE_HEIGHT: f64 = 230.0;
+const LAUNCHER_OPEN_HEIGHT: f64 = 658.0;
+// 搜索框中心停在工作区 35% 高度处，水平居中。
+const LAUNCHER_CENTER_RATIO: f64 = 0.35;
+// 窗口顶到搜索框中心的距离：CSS 留白 118 + 搜索条半高 42。
+const LAUNCHER_BAR_CENTER_OFFSET: f64 = 160.0;
 
 fn set_launcher_size(window: &tauri::WebviewWindow, height: f64) {
     let scale = window.scale_factor().unwrap_or(1.0);
@@ -321,7 +325,8 @@ fn place_launcher(window: &tauri::WebviewWindow, height: f64) {
     let max_y = area.position.y + area.size.height as i32 - height_px as i32;
     let x = (area.position.x + (area.size.width as i32 - width as i32) / 2)
         .clamp(area.position.x, max_x.max(area.position.x));
-    let y = (area.position.y + (area.size.height as f64 * LAUNCHER_TOP_RATIO) as i32)
+    let y = (area.position.y
+        + (area.size.height as f64 * LAUNCHER_CENTER_RATIO - LAUNCHER_BAR_CENTER_OFFSET) as i32)
         .clamp(area.position.y, max_y.max(area.position.y));
     let _ = window.set_position(PhysicalPosition::new(x, y));
 }
@@ -758,6 +763,48 @@ fn set_file_types(
         spawn_file_scan(&app);
     }
     Ok(saved)
+}
+
+#[tauri::command]
+fn set_mascot(app: AppHandle, enabled: bool) -> Result<(), String> {
+    settings::save_mascot(&app, enabled)
+}
+
+#[tauri::command]
+fn set_mascot_id(app: AppHandle, id: String) -> Result<String, String> {
+    settings::save_mascot_id(&app, &id)
+}
+
+#[tauri::command]
+async fn fetch_mascot_manifest() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(mascot::manifest)
+        .await
+        .map_err(|_| "offline".to_string())?
+}
+
+#[tauri::command]
+async fn fetch_mascot_file(path: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || mascot::file(&path))
+        .await
+        .map_err(|_| "offline".to_string())?
+}
+
+#[tauri::command]
+fn save_mascot_pose(app: AppHandle, id: String, pose: String, data: String) -> Result<(), String> {
+    mascot::save_pose(&app, &id, &pose, &data)
+}
+
+#[tauri::command]
+fn read_cached_mascot(
+    app: AppHandle,
+    id: String,
+) -> Result<std::collections::HashMap<String, String>, String> {
+    mascot::read_cached(&app, &id)
+}
+
+#[tauri::command]
+fn cached_mascot_ids(app: AppHandle) -> Vec<String> {
+    mascot::cached_ids(&app)
 }
 
 fn store_catalog(state: &AppState, scanned: Result<Vec<catalog::AppEntry>, String>) {
@@ -1352,6 +1399,13 @@ pub fn run() {
             reveal_file,
             set_file_search,
             set_file_types,
+            set_mascot,
+            set_mascot_id,
+            fetch_mascot_manifest,
+            fetch_mascot_file,
+            save_mascot_pose,
+            read_cached_mascot,
+            cached_mascot_ids,
             refresh_index,
             launch,
             launch_admin,

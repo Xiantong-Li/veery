@@ -13,6 +13,8 @@ export type SettingsInfo = {
   hint: string;
   fileSearch: boolean;
   fileTypes: string[];
+  mascot: boolean;
+  mascotId: string;
   fileTypeOptions: { id: string; extensions: string[] }[];
   name: string;
   version: string;
@@ -64,6 +66,7 @@ export function watchSystemTheme(getChoice: () => ThemeChoice) {
 const zh = {
   general: "常用设置",
   files: "文件搜索",
+  companion: "伙伴",
   about: "关于",
   autostart: "开机启动",
   autostartDesc: "登录 Windows 后自动打开 Veery，并留在托盘里。",
@@ -104,6 +107,17 @@ const zh = {
   fileTypes: "文件类型",
   fileTypesDesc: "只显示勾选类型的文件，可以多选。",
   fileSearchFirst: "请先开启文件搜索",
+  companionShow: "显示伙伴",
+  companionShowDesc: "开启后，伙伴会趴在搜索框右上角陪你搜索。",
+  companionPick: "选择伙伴",
+  companionPickDesc: "点击选择趴在搜索框上的伙伴，以后会有更多伙伴加入。",
+  companionOnline: "在线伙伴",
+  companionOnlineDesc: "点选后自动下载，下载过的伙伴离线也能用。",
+  companionOffline: "当前无网络，无法加载在线伙伴。",
+  companionFailed: "在线伙伴加载失败。",
+  companionRetryAction: "重试",
+  companionDownloading: "下载中…",
+  companionRetry: "下载失败，点按重试",
   typeDocument: "文档",
   typeImage: "图片",
   typeMedia: "音视频",
@@ -126,6 +140,7 @@ const zh = {
 const en = {
   general: "General",
   files: "File search",
+  companion: "Companion",
   about: "About",
   autostart: "Start with Windows",
   autostartDesc: "Open Veery when you sign in to Windows, and keep it in the tray.",
@@ -166,6 +181,17 @@ const en = {
   fileTypes: "File types",
   fileTypesDesc: "Only show the checked types. You can pick more than one.",
   fileSearchFirst: "Turn on File search first",
+  companionShow: "Show companion",
+  companionShowDesc: "When on, your companion perches on the top-right of the search box.",
+  companionPick: "Choose a companion",
+  companionPickDesc: "Pick who perches on the search box. More companions will join later.",
+  companionOnline: "Online companions",
+  companionOnlineDesc: "Pick one to download it. Downloaded companions work offline.",
+  companionOffline: "You're offline, so online companions can't be loaded.",
+  companionFailed: "Could not load online companions.",
+  companionRetryAction: "Retry",
+  companionDownloading: "Downloading…",
+  companionRetry: "Download failed, tap to retry",
   typeDocument: "Documents",
   typeImage: "Images",
   typeMedia: "Audio & video",

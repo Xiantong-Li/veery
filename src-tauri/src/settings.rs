@@ -47,6 +47,8 @@ pub struct SettingsInfo {
     pub hint: String,
     pub file_search: bool,
     pub file_types: Vec<String>,
+    pub mascot: bool,
+    pub mascot_id: String,
     pub file_type_options: Vec<FileTypeInfo>,
     pub name: &'static str,
     pub version: &'static str,
@@ -63,6 +65,8 @@ pub struct Preferences {
     pub fast_autostart: bool,
     pub file_search: bool,
     pub file_types: Vec<String>,
+    pub mascot: bool,
+    pub mascot_id: String,
     pub dismissed_update: String,
 }
 
@@ -81,6 +85,10 @@ struct Saved {
     file_search: bool,
     #[serde(default = "default_file_types")]
     file_types: Vec<String>,
+    #[serde(default)]
+    mascot: bool,
+    #[serde(default = "default_mascot_id")]
+    mascot_id: String,
     /// 用户已经看过这个版本的提醒，不再为它显示圆点。
     #[serde(default)]
     dismissed_update: String,
@@ -96,6 +104,24 @@ fn default_theme() -> String {
 
 fn default_file_types() -> Vec<String> {
     vec!["document".to_string(), "image".to_string()]
+}
+
+fn default_mascot_id() -> String {
+    "lanbao".to_string()
+}
+
+/// 角色 id 只允许小写字母、数字和连字符，旧设置或手改配置里的脏值回落到默认角色。
+pub fn normalize_mascot_id(value: &str) -> String {
+    let cleaned: String = value
+        .chars()
+        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '-')
+        .take(24)
+        .collect();
+    if cleaned.is_empty() {
+        default_mascot_id()
+    } else {
+        cleaned
+    }
 }
 
 pub fn normalize_language(value: &str) -> String {
@@ -136,6 +162,8 @@ pub fn info(autostart: bool, fast_autostart: bool, prefs: &Preferences) -> Setti
         hint: prefs.hint.clone(),
         file_search: prefs.file_search,
         file_types: prefs.file_types.clone(),
+        mascot: prefs.mascot,
+        mascot_id: prefs.mascot_id.clone(),
         file_type_options: crate::files::GROUPS
             .iter()
             .map(|(id, extensions)| FileTypeInfo {
@@ -247,6 +275,8 @@ pub fn load(app: &AppHandle) -> Preferences {
             fast_autostart: false,
             file_search: false,
             file_types: default_file_types(),
+            mascot: false,
+            mascot_id: default_mascot_id(),
             dismissed_update: String::new(),
         };
     };
@@ -264,6 +294,8 @@ pub fn load(app: &AppHandle) -> Preferences {
         file_search: saved.file_search,
         // 用户明确关掉全部类型就保持为空；只有旧设置缺这个字段时才用默认值。
         file_types,
+        mascot: saved.mascot,
+        mascot_id: normalize_mascot_id(&saved.mascot_id),
         dismissed_update: saved.dismissed_update,
     }
 }
@@ -305,6 +337,8 @@ fn store(app: &AppHandle, prefs: &Preferences) -> Result<(), String> {
         fast_autostart: prefs.fast_autostart,
         file_search: prefs.file_search,
         file_types: prefs.file_types.clone(),
+        mascot: prefs.mascot,
+        mascot_id: prefs.mascot_id.clone(),
         dismissed_update: prefs.dismissed_update.clone(),
     })
     .map_err(|error| error.to_string())?;
@@ -358,6 +392,19 @@ pub fn save_file_search(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let mut prefs = load(app);
     prefs.file_search = enabled;
     store(app, &prefs)
+}
+
+pub fn save_mascot(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let mut prefs = load(app);
+    prefs.mascot = enabled;
+    store(app, &prefs)
+}
+
+pub fn save_mascot_id(app: &AppHandle, id: &str) -> Result<String, String> {
+    let mut prefs = load(app);
+    prefs.mascot_id = normalize_mascot_id(id);
+    store(app, &prefs)?;
+    Ok(prefs.mascot_id)
 }
 
 pub fn save_file_types(app: &AppHandle, types: &[String]) -> Result<Vec<String>, String> {

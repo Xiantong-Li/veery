@@ -4,6 +4,19 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import logo from "./assets/Veery-Log_compressed.png";
 import {
+  POSE_NAMES,
+  dataUrl,
+  downloadCharacter,
+  ensurePose,
+  fetchManifest,
+  isBundled,
+  mascots,
+  posesFromCache,
+  registerRemoteMascot,
+  type Mascot,
+  type RemoteCharacter,
+} from "./mascots";
+import {
   applyTheme,
   copy,
   giteeRepo,
@@ -33,13 +46,16 @@ const emit = defineEmits<{
   recordingChange: [boolean];
   filesChange: [boolean];
   fileTypesChange: [number];
+  mascotChange: [boolean];
+  mascotIdChange: [string];
   updateDismiss: [];
 }>();
 
-const page = ref<"general" | "files" | "about">("general");
+const page = ref<"general" | "files" | "companion" | "about">("general");
 const menuEl = ref<HTMLElement | null>(null);
 const generalEl = ref<HTMLButtonElement | null>(null);
 const filesEl = ref<HTMLButtonElement | null>(null);
+const companionEl = ref<HTMLButtonElement | null>(null);
 const aboutEl = ref<HTMLButtonElement | null>(null);
 const selectionReady = ref(false);
 const selection = ref({ y: 0, height: 0 });
@@ -77,8 +93,9 @@ watch(
 
 watch(recording, (value) => emit("recordingChange", value));
 
-watch(page, () => {
+watch(page, (value) => {
   void nextTick(moveSelection);
+  if (value === "companion") void loadRemote();
 });
 
 watch(
@@ -103,6 +120,7 @@ watch(
         selectionReady.value = true;
       });
     });
+    if (page.value === "companion") void loadRemote();
   },
 );
 
@@ -119,7 +137,13 @@ watch(
 
 function moveSelection() {
   const button =
-    page.value === "general" ? generalEl.value : page.value === "files" ? filesEl.value : aboutEl.value;
+    page.value === "general"
+      ? generalEl.value
+      : page.value === "files"
+        ? filesEl.value
+        : page.value === "companion"
+          ? companionEl.value
+          : aboutEl.value;
   if (!button) return;
   selection.value = { y: button.offsetTop, height: button.offsetHeight };
 }
@@ -134,6 +158,8 @@ async function load() {
   emit("themeChange", themeOf(next.theme));
   emit("filesChange", next.fileSearch);
   emit("fileTypesChange", next.fileTypes.length);
+  emit("mascotChange", next.mascot);
+  emit("mascotIdChange", next.mascotId);
   await nextTick();
   requestAnimationFrame(() => {
     switchReady.value = true;
@@ -235,6 +261,157 @@ function toggleFileSearch() {
       }
     }
   });
+}
+
+let mascotWrite = Promise.resolve();
+let mascotTicket = 0;
+let mascotIdTicket = 0;
+
+function toggleMascot() {
+  if (!info.value) return;
+  const enabled = !info.value.mascot;
+  const mine = ++mascotTicket;
+  info.value.mascot = enabled;
+  settingsPanelCache.value = info.value;
+  emit("mascotChange", enabled);
+  message.value = "";
+  mascotWrite = mascotWrite.then(async () => {
+    try {
+      await invoke("set_mascot", { enabled });
+    } catch (cause) {
+      if (mine === mascotTicket && info.value) {
+        info.value.mascot = !enabled;
+        settingsPanelCache.value = info.value;
+        emit("mascotChange", !enabled);
+        message.value = errorText(cause);
+      }
+    }
+  });
+}
+
+function pickMascot(id: string) {
+  if (!info.value || info.value.mascotId === id) return;
+  const previous = info.value.mascotId;
+  const mine = ++mascotIdTicket;
+  info.value.mascotId = id;
+  settingsPanelCache.value = info.value;
+  emit("mascotIdChange", id);
+  message.value = "";
+  mascotWrite = mascotWrite.then(async () => {
+    try {
+      await invoke("set_mascot_id", { id });
+    } catch (cause) {
+      if (mine === mascotIdTicket && info.value) {
+        info.value.mascotId = previous;
+        settingsPanelCache.value = info.value;
+        emit("mascotIdChange", previous);
+        message.value = errorText(cause);
+      }
+    }
+  });
+}
+
+type RemoteCard = {
+  entry: RemoteCharacter;
+  state: "loading" | "preview" | "downloading" | "ready" | "failed";
+  thumb: string;
+};
+
+const remoteCards = ref<RemoteCard[]>([]);
+const remoteNotice = ref<"" | "offline" | "failed">("");
+let remoteBusy = false;
+
+async function loadRemote() {
+  if (remoteBusy) return;
+  remoteBusy = true;
+  try {
+    const cachedIds = await invoke<string[]>("cached_mascot_ids");
+    let entries: RemoteCharacter[] = [];
+    let notice: "" | "offline" | "failed" = "";
+    try {
+      entries = await fetchManifest();
+    } catch (cause) {
+      notice = String(cause) === "offline" ? "offline" : "failed";
+    }
+    const byId = new Map<string, RemoteCharacter>();
+    for (const entry of entries) {
+      if (!isBundled(entry.id)) byId.set(entry.id, entry);
+    }
+    // 缓存里可能有清单已下架的角色，仍允许选用。
+    for (const id of cachedIds) {
+      if (!byId.has(id) && !isBundled(id)) {
+        byId.set(id, { id, name: { zh: id, en: id }, poses: {} as RemoteCharacter["poses"] });
+      }
+    }
+    const cards: RemoteCard[] = [];
+    for (const entry of byId.values()) {
+      const cached = await invoke<Record<string, string>>("read_cached_mascot", { id: entry.id });
+      const complete = POSE_NAMES.every((pose) => cached[pose]);
+      const card: RemoteCard = {
+        entry,
+        state: complete ? "ready" : cached.idle ? "preview" : "loading",
+        thumb: cached.idle ? dataUrl(cached.idle) : "",
+      };
+      if (complete) {
+        registerRemoteMascot({
+          id: entry.id,
+          name: entry.name,
+          thumb: card.thumb,
+          poses: posesFromCache(cached),
+        });
+      }
+      cards.push(card);
+    }
+    remoteCards.value = cards;
+    remoteNotice.value = notice;
+    await Promise.all(
+      cards
+        .filter((card) => card.state === "loading")
+        .map(async (card) => {
+          try {
+            card.thumb = await ensurePose(card.entry, "idle");
+            card.state = "preview";
+          } catch {
+            card.state = "failed";
+          }
+        }),
+    );
+  } finally {
+    remoteBusy = false;
+  }
+}
+
+async function pickRemote(card: RemoteCard) {
+  if (!info.value || card.state === "downloading" || card.state === "loading") return;
+  if (info.value.mascotId === card.entry.id && card.state === "ready") return;
+  const previous = card.state;
+  card.state = "downloading";
+  message.value = "";
+  try {
+    const cached = await invoke<Record<string, string>>("read_cached_mascot", { id: card.entry.id });
+    let mascot: Mascot;
+    if (POSE_NAMES.every((pose) => cached[pose])) {
+      mascot = {
+        id: card.entry.id,
+        name: card.entry.name,
+        thumb: dataUrl(cached.idle),
+        poses: posesFromCache(cached),
+      };
+      registerRemoteMascot(mascot);
+    } else {
+      mascot = await downloadCharacter(card.entry);
+    }
+    card.thumb = mascot.thumb;
+    card.state = "ready";
+    if (info.value.mascotId === card.entry.id) {
+      emit("mascotIdChange", card.entry.id);
+    } else {
+      pickMascot(card.entry.id);
+    }
+  } catch (cause) {
+    card.state = previous;
+    showToast(errorText(cause));
+  }
 }
 
 function showToast(text: string) {
@@ -500,6 +677,14 @@ defineExpose({
         <button ref="filesEl" type="button" :class="{ current: page === 'files' }" @click="page = 'files'">
           {{ t.files }}
         </button>
+        <button
+          ref="companionEl"
+          type="button"
+          :class="{ current: page === 'companion' }"
+          @click="page = 'companion'"
+        >
+          {{ t.companion }}
+        </button>
         <button ref="aboutEl" type="button" :class="{ current: page === 'about' }" @click="openAbout">
           {{ t.about }}
           <span v-if="update" class="nav-dot" aria-hidden="true"></span>
@@ -647,6 +832,73 @@ defineExpose({
               <span></span>
             </button>
           </div>
+        </div>
+      </div>
+      <p v-if="message" class="message">{{ message }}</p>
+    </section>
+
+    <section v-else-if="page === 'companion'" class="pane">
+      <h1>{{ t.companion }}</h1>
+      <div class="row">
+        <div>
+          <p class="title">{{ t.companionShow }}</p>
+          <p class="desc">{{ t.companionShowDesc }}</p>
+        </div>
+        <button
+          type="button"
+          class="switch"
+          :class="{ on: info?.mascot, ready: switchReady }"
+          :aria-pressed="info?.mascot"
+          @click="toggleMascot"
+        >
+          <span></span>
+        </button>
+      </div>
+      <div class="row stacked">
+        <div>
+          <p class="title">{{ t.companionPick }}</p>
+          <p class="desc">{{ t.companionPickDesc }}</p>
+        </div>
+        <div class="companion-list">
+          <button
+            v-for="mascot in mascots"
+            :key="mascot.id"
+            type="button"
+            class="companion-card"
+            :class="{ current: info?.mascotId === mascot.id }"
+            :aria-pressed="info?.mascotId === mascot.id"
+            @click="pickMascot(mascot.id)"
+          >
+            <img :src="mascot.thumb" alt="" />
+            <span>{{ mascot.name[language] }}</span>
+          </button>
+        </div>
+      </div>
+      <div v-if="remoteCards.length || remoteNotice" class="row stacked">
+        <div>
+          <p class="title">{{ t.companionOnline }}</p>
+          <p v-if="remoteNotice" class="desc">
+            {{ remoteNotice === "offline" ? t.companionOffline : t.companionFailed }}
+            <button type="button" class="retry" @click="loadRemote">{{ t.companionRetryAction }}</button>
+          </p>
+          <p v-else class="desc">{{ t.companionOnlineDesc }}</p>
+        </div>
+        <div v-if="remoteCards.length" class="companion-list">
+          <button
+            v-for="card in remoteCards"
+            :key="card.entry.id"
+            type="button"
+            class="companion-card"
+            :class="{ current: info?.mascotId === card.entry.id, busy: card.state === 'downloading' }"
+            :aria-pressed="info?.mascotId === card.entry.id"
+            @click="pickRemote(card)"
+          >
+            <img v-if="card.thumb" :src="card.thumb" alt="" />
+            <span v-else class="thumb-empty" aria-hidden="true"></span>
+            <span>{{ card.entry.name[language] }}</span>
+            <span v-if="card.state === 'downloading'" class="card-note">{{ t.companionDownloading }}</span>
+            <span v-else-if="card.state === 'failed'" class="card-note">{{ t.companionRetry }}</span>
+          </button>
         </div>
       </div>
       <p v-if="message" class="message">{{ message }}</p>
@@ -846,6 +1098,74 @@ h1 {
 
 .type-list.dim .type-row:hover {
   background: transparent;
+}
+
+.companion-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.companion-card {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 10px 14px;
+  border: 2px solid transparent;
+  border-radius: 12px;
+  background: var(--panel-row);
+  color: var(--panel-text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.companion-card img {
+  width: 72px;
+  height: 72px;
+  object-fit: contain;
+  object-position: center bottom;
+}
+
+.companion-card.current {
+  border-color: var(--panel-switch-on);
+}
+
+.companion-card:hover {
+  background: var(--panel-choice);
+}
+
+.companion-card.busy {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+.thumb-empty {
+  width: 72px;
+  height: 72px;
+  border: 2px dashed var(--panel-line);
+  border-radius: 12px;
+}
+
+.card-note {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.retry {
+  margin-left: 8px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--panel-switch-on);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.retry:hover {
+  text-decoration: underline;
 }
 
 .type-row {

@@ -1,9 +1,4 @@
 use serde::Serialize;
-use windows::Win32::Networking::WinHttp::{
-    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpReadData,
-    WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetTimeouts, INTERNET_DEFAULT_HTTPS_PORT,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
-};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,83 +70,9 @@ fn release_tag(body: &str) -> Option<String> {
     value.get("tag_name")?.as_str().map(str::to_string)
 }
 
-struct Internet(*mut core::ffi::c_void);
-
-impl Drop for Internet {
-    fn drop(&mut self) {
-        if !self.0.is_null() {
-            unsafe {
-                let _ = WinHttpCloseHandle(self.0);
-            }
-        }
-    }
-}
-
 fn http_get(host: &str, path: &str) -> Result<String, ()> {
-    unsafe {
-        let session = WinHttpOpen(
-            windows::core::w!("Veery"),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            windows::core::PCWSTR(std::ptr::null()),
-            windows::core::PCWSTR(std::ptr::null()),
-            0,
-        );
-        if session.is_null() {
-            return Err(());
-        }
-        let session = Internet(session);
-        let _ = WinHttpSetTimeouts(session.0, 4000, 4000, 8000, 8000);
-        let host_wide: Vec<u16> = host.encode_utf16().chain(std::iter::once(0)).collect();
-        let connect = WinHttpConnect(
-            session.0,
-            windows::core::PCWSTR(host_wide.as_ptr()),
-            INTERNET_DEFAULT_HTTPS_PORT,
-            0,
-        );
-        if connect.is_null() {
-            return Err(());
-        }
-        let connect = Internet(connect);
-        let path_wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-        let request = WinHttpOpenRequest(
-            connect.0,
-            windows::core::w!("GET"),
-            windows::core::PCWSTR(path_wide.as_ptr()),
-            windows::core::PCWSTR(std::ptr::null()),
-            windows::core::PCWSTR(std::ptr::null()),
-            std::ptr::null(),
-            WINHTTP_FLAG_SECURE,
-        );
-        if request.is_null() {
-            return Err(());
-        }
-        let request = Internet(request);
-        let headers: Vec<u16> = "User-Agent: Veery\r\nAccept: application/json\r\n"
-            .encode_utf16()
-            .collect();
-        WinHttpSendRequest(request.0, Some(&headers), None, 0, 0, 0).map_err(|_| ())?;
-        WinHttpReceiveResponse(request.0, std::ptr::null_mut()).map_err(|_| ())?;
-        let mut body = Vec::new();
-        let mut chunk = [0u8; 8192];
-        loop {
-            let mut read = 0u32;
-            WinHttpReadData(
-                request.0,
-                chunk.as_mut_ptr().cast(),
-                chunk.len() as u32,
-                &mut read,
-            )
-            .map_err(|_| ())?;
-            if read == 0 {
-                break;
-            }
-            body.extend_from_slice(&chunk[..read as usize]);
-            if body.len() > 262_144 {
-                return Err(());
-            }
-        }
-        String::from_utf8(body).map_err(|_| ())
-    }
+    let (_, body) = crate::net::get(host, path, 262_144)?;
+    String::from_utf8(body).map_err(|_| ())
 }
 
 #[cfg(test)]

@@ -20,6 +20,12 @@ Veery（维里）是轻量的 Windows 托盘启动器。按下全局快捷键后
 
 支持 **Windows 10 及以上**（含 Windows 11）。
 
+<p align="center">
+  <img src="src/assets/sousuo_ys.png" alt="Veery 搜索框" width="720" />
+</p>
+
+<p align="center">搜索框右上角的伙伴默认关闭，可在设置「伙伴」页开启并选择。</p>
+
 ## 下载
 
 安装包未做代码签名。国内用户建议从码云下载，国外用户从 GitHub 下载。发行页里选 `veery_*_x64-setup.exe` 即可。

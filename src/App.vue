@@ -4,6 +4,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import SettingsPanel from "./SettingsPanel.vue";
 import {
+  POSE_NAMES,
+  dataUrl,
+  hasMascot,
+  isBundled,
+  mascotById,
+  posesFromCache,
+  registerRemoteMascot,
+} from "./mascots";
+import {
   applyTheme,
   copy,
   languageOf,
@@ -46,6 +55,11 @@ const settingsMounted = ref(false);
 const resumeSettings = ref(false);
 const recording = ref(false);
 const update = ref<{ latest: string; url: string } | null>(null);
+const celebrate = ref(false);
+const mascotHover = ref(false);
+const mascotOn = ref(Boolean(initial?.mascot));
+const mascotId = ref(initial?.mascotId || "lanbao");
+const mascotRev = ref(0);
 let suppressSettingsFocusClose = false;
 const inputEl = ref<HTMLInputElement | null>(null);
 const sheetEl = ref<HTMLElement | null>(null);
@@ -54,6 +68,9 @@ const menu = ref<{ kind: "app" | "file"; id: number; x: number; y: number } | nu
 const panelEl = ref<InstanceType<typeof SettingsPanel> | null>(null);
 let request = 0;
 let fileRequest = 0;
+// 结果列表可能正好渲染在静止的鼠标下面，mouseenter 会误抢选中；
+// 只有鼠标真的动过之后，悬停选中才生效。
+let hoverArmed = false;
 
 const settled = computed(() => query.value.trim() !== "" && answered.value === query.value);
 const fileWanted = computed(
@@ -68,6 +85,9 @@ const rows = computed<Row[]>(() => [
   ...fileHits.value.map((hit) => ({ kind: "file" as const, ...hit })),
 ]);
 const appCount = computed(() => results.value.length);
+watch([results, fileHits], () => {
+  hoverArmed = false;
+});
 const searchOpen = computed(
   () =>
     !settingsOpen.value &&
@@ -91,6 +111,19 @@ const note = computed<{ text: string; error: boolean } | null>(() => {
   return null;
 });
 const drawerOpen = computed(() => settingsOpen.value || searchOpen.value);
+
+const pose = computed(() => {
+  void mascotRev.value;
+  const poses = mascotById(mascotId.value).poses;
+  if (mascotHover.value) return poses.happy;
+  if (settingsOpen.value) return poses.idle;
+  if (error.value || indexing.value || fileIndexing.value) return poses.dizzy;
+  if (searching.value || fileSearching.value) return poses.tap;
+  if (settled.value && rows.value.length === 0) return poses.shrug;
+  if (celebrate.value) return poses.happy;
+  if (update.value) return poses.point;
+  return poses.idle;
+});
 
 const DRAWER_MS = 280;
 let searchTimer = 0;
@@ -170,6 +203,7 @@ function warmSettingsPanel() {
 
 function openSettingsPanel() {
   clearSearch(true);
+  celebrate.value = false;
   warmSettingsPanel();
   settingsOpen.value = true;
   recording.value = false;
@@ -202,6 +236,7 @@ function onInputFocus() {
 function onQueryInput(event: Event) {
   const target = event.target;
   if (!(target instanceof HTMLInputElement)) return;
+  celebrate.value = false;
   if (settingsOpen.value) closeSettings();
   query.value = target.value;
   scheduleRefresh();
@@ -333,6 +368,7 @@ async function act(command: "launch" | "launch_admin" | "reveal", id: number) {
       await invoke(command, { id });
     } else {
       await invoke(command, { id, query: query.value });
+      celebrate.value = true;
     }
     // 输入框交给 hidden/shown 事件清空：启动要等一会儿，这里再清一次会抹掉再次唤出后已经输入的内容。
   } catch (cause) {
@@ -370,6 +406,14 @@ async function openSelected() {
   }
 }
 
+function hoverSelect(index: number) {
+  if (hoverArmed) selected.value = index;
+}
+
+function onPointerMove() {
+  hoverArmed = true;
+}
+
 async function openMenu(index: number, event: MouseEvent) {
   const hit = results.value[index];
   if (!hit) return;
@@ -391,6 +435,10 @@ async function openFileMenu(index: number, event: MouseEvent) {
 function onPointerDown(event: PointerEvent) {
   const target = event.target;
   if (!(target instanceof Node)) return;
+  if (target instanceof HTMLElement && target.classList.contains("mascot")) {
+    menu.value = null;
+    return;
+  }
   if (menuEl.value?.contains(target)) return;
   if (sheetEl.value?.contains(target)) {
     if (event.button === 2) return;
@@ -470,6 +518,36 @@ function onFileTypesChange(count: number) {
   scheduleFileRefresh();
 }
 
+async function loadRemoteMascot(id: string) {
+  if (hasMascot(id)) return;
+  try {
+    const cached = await invoke<Record<string, string>>("read_cached_mascot", { id });
+    if (!POSE_NAMES.every((pose) => cached[pose])) {
+      mascotId.value = "lanbao";
+      return;
+    }
+    registerRemoteMascot({
+      id,
+      name: { zh: id, en: id },
+      thumb: dataUrl(cached.idle),
+      poses: posesFromCache(cached),
+    });
+    mascotRev.value += 1;
+  } catch {
+    mascotId.value = "lanbao";
+  }
+}
+
+function onMascotChange(enabled: boolean) {
+  mascotOn.value = enabled;
+  if (enabled && !isBundled(mascotId.value)) void loadRemoteMascot(mascotId.value);
+}
+
+function onMascotIdChange(id: string) {
+  mascotId.value = id;
+  if (!isBundled(id)) void loadRemoteMascot(id);
+}
+
 function dismissUpdate() {
   const current = update.value;
   update.value = null;
@@ -486,6 +564,7 @@ async function focusInput() {
 
 function resetChrome(options: { preserveResume?: boolean } = {}) {
   window.clearTimeout(resultsClearTimer);
+  mascotHover.value = false;
   if (!options.preserveResume) {
     resumeSettings.value = false;
   }
@@ -514,6 +593,8 @@ let stopThemeWatch: (() => void) | null = null;
 
 onMounted(async () => {
   window.addEventListener("pointerdown", onPointerDown);
+  window.addEventListener("pointermove", onPointerMove);
+  if (mascotOn.value && !isBundled(mascotId.value)) void loadRemoteMascot(mascotId.value);
   try {
     stops.push(
       await listen("shown", async () => {
@@ -583,6 +664,7 @@ onUnmounted(() => {
   window.clearTimeout(settingsWarmTimer);
   window.clearTimeout(resultsClearTimer);
   window.removeEventListener("pointerdown", onPointerDown);
+  window.removeEventListener("pointermove", onPointerMove);
   for (const stop of stops) stop();
   stopThemeWatch?.();
 });
@@ -637,6 +719,8 @@ onUnmounted(() => {
             @recording-change="recording = $event"
             @files-change="onFilesChange"
             @file-types-change="onFileTypesChange"
+            @mascot-change="onMascotChange"
+            @mascot-id-change="onMascotIdChange"
             @update-dismiss="dismissUpdate"
           />
           <template v-if="!settingsOpen">
@@ -645,7 +729,7 @@ onUnmounted(() => {
                 <button
                   type="button"
                   :class="{ active: index === selected }"
-                  @mouseenter="selected = index"
+                  @mouseenter="hoverSelect(index)"
                   @mousedown.prevent
                   @click="act('launch', item.id)"
                   @contextmenu.prevent="openMenu(index, $event)"
@@ -663,7 +747,7 @@ onUnmounted(() => {
                   <button
                     type="button"
                     :class="{ active: appCount + index === selected }"
-                    @mouseenter="selected = appCount + index"
+                    @mouseenter="hoverSelect(appCount + index)"
                     @mousedown.prevent
                     @click="openFile(item.id)"
                     @contextmenu.prevent="openFileMenu(index, $event)"
@@ -680,6 +764,16 @@ onUnmounted(() => {
         </div>
       </div>
     </section>
+    <img
+      v-if="mascotOn"
+      class="mascot"
+      :src="pose"
+      alt=""
+      aria-hidden="true"
+      draggable="false"
+      @mouseenter="mascotHover = true"
+      @mouseleave="mascotHover = false"
+    />
     <div
       v-if="menu"
       ref="menuEl"
@@ -789,9 +883,20 @@ body {
 }
 
 .stage {
+  position: relative;
   box-sizing: border-box;
   width: 960px;
-  padding: 20px 20px 28px;
+  padding: 118px 20px 28px;
+}
+
+.mascot {
+  position: absolute;
+  top: 6px;
+  right: 116px;
+  height: 120px;
+  width: 126px;
+  object-fit: contain;
+  object-position: center bottom;
 }
 
 .sheet {
